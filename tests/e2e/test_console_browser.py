@@ -74,11 +74,11 @@ def browser() -> Iterator[Any]:
         launched.close()
 
 
-def _screenshot(page: Any, name: str) -> None:
+def _screenshot(page: Any, name: str, full_page: bool = True) -> None:
     directory = os.getenv("QUANT_ALMANAC_SCREENSHOT_DIR")
     if directory:
         Path(directory).mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(Path(directory) / f"{name}.png"), full_page=True)
+        page.screenshot(path=str(Path(directory) / f"{name}.png"), full_page=full_page)
 
 
 def test_operator_traces_champion_and_blocked_build(
@@ -102,6 +102,7 @@ def test_operator_traces_champion_and_blocked_build(
     page.locator(f'a[href="/console/models/{champion_id}"]').first.click()
     page.wait_for_url(f"**/console/models/{champion_id}")
     assert page.get_by_test_id("model-id").inner_text() == champion_id
+    _screenshot(page, "console-model-hero", full_page=False)
     stepper = page.get_by_test_id("lineage-stepper")
     assert stepper.locator("li").count() == 8
     assert stepper.locator('li[data-stage="dataset"]').get_attribute("data-status") == "pass"

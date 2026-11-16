@@ -1,10 +1,13 @@
 # Quant Almanac
 
+[![CI](https://github.com/co-rtex/quant-almanac/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/co-rtex/quant-almanac/actions/workflows/ci.yml?query=branch%3Amain)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A governed forecasting pipeline for daily US equities. Quant Almanac ingests market data, builds versioned feature datasets, trains calibrated multi-horizon classifiers, runs walk-forward backtests, generates SHAP explanations, and serves ranked signals through FastAPI.
 
 Every stage is gated and traceable. Data-quality checks block bad datasets before training, training gates block leaky splits, every registered artifact (dataset, model, backtest, SHAP) is content-addressed and re-verifiable, and any registered model can be refit from its artifacts to prove it reproduces. A read-only **Model Trust & Lineage Console** shows a reviewer where a model's data came from, which checks it passed, whether its artifacts are intact, and what it cannot claim.
 
-![Model evidence page](docs/screenshots/console-model.png)
+![Model evidence page: lineage stepper, live verification, and limitations](docs/screenshots/console-model-hero.png)
 
 > The screenshots and demo use **synthetic** random-walk data from a seeded generator. They demonstrate the pipeline and its controls. They are not market data or investment performance.
 
@@ -30,22 +33,24 @@ Quant Almanac now answers seven questions for any model, using only persisted ev
 
 ## Architecture
 
-```text
- provider ──► ingestion run ──► daily_bars ──► [dataset quality gate] ──► dataset artifact (sha-addressed)
- (yfinance /    (retry, metadata)  (Postgres)     23 checks, blocks on fail      + manifest + lineage
-  synthetic)                                           │                              │
-                                                       ▼                              ▼
-                                               quality_reports  ◄────────── [training gate] ──► model artifacts
-                                               (append-only evidence:        integrity, split,       + config
-                                                dataset_build / training /   label-horizon embargo   + provenance
-                                                reproduction)                       │
-                                                       ▲                            ▼
-                                                       │            evaluations ─ backtests (walk-forward guard)
-                                          reproduce-model ◄──────── signals ───── SHAP runs (sha-addressed)
-                                                                           │
-                              GovernanceService (lineage · live verification · limitations)
-                                     │                         │
-                         /v1/governance/* JSON API     /console (server-rendered, read-only)
+```mermaid
+flowchart LR
+    P["Provider<br/>yfinance · synthetic"] --> I["Ingestion runs<br/>retry + metadata"]
+    I --> B[("PostgreSQL<br/>daily_bars + registry")]
+    B --> DQ{"Dataset quality gate<br/>23 checks"}
+    DQ -- fail --> QR[("quality_reports<br/>append-only evidence")]
+    DQ -- pass --> D["Dataset artifact<br/>sha-addressed + lineage"]
+    D --> TG{"Training gate<br/>integrity · split · embargo"}
+    TG -- fail --> QR
+    TG -- pass --> M["Model artifacts<br/>config + provenance"]
+    M --> E["Evaluations"]
+    M --> BT["Walk-forward backtests<br/>leakage guard"]
+    M --> S["SHAP runs"]
+    M --> SG["Signal snapshots"]
+    M --> R["reproduce-model"] --> QR
+    QR & D & M & E & BT & S --> G["GovernanceService<br/>lineage · live verification · limitations"]
+    G --> API["/v1/governance JSON API"]
+    G --> C["/console (read-only)"]
 ```
 
 | Package | Responsibility |
@@ -56,6 +61,10 @@ Quant Almanac now answers seven questions for any model, using only persisted ev
 | `quant_signal.api.routes.governance` | Read-only JSON endpoints with 404s for unknown ids |
 | `quant_signal.ingestion.synthetic` | Seeded, window-invariant synthetic provider with documented defect injection |
 | `quant_signal.demo` | `quant-almanac-demo`: the reproducible end-to-end demonstration |
+
+The Python package (`quant_signal`), CLI (`quant-signal-pipeline`), and distribution name keep their original identifiers so existing installs and scripts keep working.
+
+**Tech stack:** Python 3.14 · FastAPI and Pydantic · Jinja2 · PostgreSQL, SQLAlchemy, Alembic, and Psycopg · pandas, NumPy, and PyArrow/Parquet · scikit-learn and SHAP · Ruff, strict mypy, pytest, Playwright · Docker Compose and GitHub Actions.
 
 The existing ingestion, feature, training, backtesting, explainability, and serving packages are unchanged in contract. They now call the gates and record lineage. See [ARCHITECTURE.md](ARCHITECTURE.md) for decisions and tradeoffs, and [docs/case-study.md](docs/case-study.md) for the engineering write-up.
 
@@ -175,7 +184,7 @@ Commands executed for this change (Python 3.14.6, Linux):
 | `quant-almanac-demo run` (SQLite and PostgreSQL 16) | all steps as expected; reproduction max \|Δp\| = 0 on 905 test rows |
 | Independent review pass | 13 findings; every confirmed defect fixed with a regression test (see the case study) |
 
-The CI workflow now also runs the migration round-trip on PostgreSQL 17 (head → previous → base), then the full demo on that PostgreSQL database, plus a separate Playwright job. Those CI steps had not executed on GitHub when this README was written.
+GitHub Actions runs lint, strict typecheck, and the test suite. It then runs the migration round-trip on PostgreSQL 17 (head → previous → base) and the full demo against that PostgreSQL database. A separate Playwright browser job also runs. All of these passed on the pull request that introduced this capability.
 
 What the demo does **not** show: predictive skill. On random-walk data the 5d champion's test ROC-AUC is 0.401 (approx. 95% CI 0.363–0.439), below chance after a regime shift. The console reports this as a high-severity limitation and marks the evaluation stage as a warning, which is the point.
 
@@ -191,6 +200,7 @@ What the demo does **not** show: predictive skill. On random-walk data the 5d ch
 - The API returns local artifact paths. The console loads model bundles (joblib) only after their hash matches the registry.
 - AUC intervals use Hanley–McNeil, which assumes independent observations. Overlapping multi-day labels make the true interval wider, and the console says so.
 - Reproduction is exact within one runtime. Library upgrades are flagged by version comparison and may change predictions within numerical tolerance.
+- yfinance is a development data source with no production SLA. Backtest costs and slippage default to zero unless configured. Nothing in this repository is investment advice or a performance claim.
 - Universe selection is fixed at build time, so survivorship bias is possible. Champion selection uses a single embargoed holdout. Backtests are simplified long-only equal-weight simulations.
 
 ## Pipeline CLI reference
@@ -239,7 +249,7 @@ make migrate
 make run-api
 ```
 
-Set `MARKET_DATA_PROVIDER=synthetic` to use the synthetic generator instead of yfinance. Provider retry settings (`MARKET_DATA_MAX_ATTEMPTS`, `MARKET_DATA_BACKOFF_SECONDS`, `MARKET_DATA_BACKOFF_MULTIPLIER`) and backtest cost settings (`BACKTEST_TRANSACTION_COST_BPS`, `BACKTEST_SLIPPAGE_BPS`) are documented in `.env.example`. Note that `make run-api` binds `0.0.0.0`, so use it only on trusted networks.
+Set `MARKET_DATA_PROVIDER=synthetic` to use the synthetic generator instead of yfinance. Provider retry settings (`MARKET_DATA_MAX_ATTEMPTS`, `MARKET_DATA_BACKOFF_SECONDS`, `MARKET_DATA_BACKOFF_MULTIPLIER`) and backtest cost settings (`BACKTEST_TRANSACTION_COST_BPS`, `BACKTEST_SLIPPAGE_BPS`) are documented in `.env.example`. `make run-api` binds to loopback (127.0.0.1) because the API and console have no authentication. Put authentication in front of them before binding to a network interface.
 
 ## Validation workflow
 
@@ -259,6 +269,10 @@ Set `MARKET_DATA_PROVIDER=synthetic` to use the synthetic generator instead of y
 │   ├── console/              # Templates, static CSS, view helpers
 │   └── ...                   # ingestion, features, training, backtesting, explainability, api, cli
 ├── tests/                    # unit, integration, e2e (Playwright)
-├── ARCHITECTURE.md · CHANGELOG.md · EXECUTION_PLAN.md
+├── ARCHITECTURE.md · CHANGELOG.md · EXECUTION_PLAN.md · LICENSE
 └── Makefile · docker-compose.yml · pyproject.toml
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Christian Cortez
