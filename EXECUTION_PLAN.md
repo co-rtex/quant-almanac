@@ -23,6 +23,7 @@ Extend the validated MVP with production-minded realism improvements, starting w
 | 13. Provider metadata and configuration | Complete | Provider fetch envelope, factory-based selection, and richer ingestion run metadata |
 | 14. Retry-aware ingestion hardening | Complete | Failure classification, deterministic backoff, and attempt-level metadata |
 | 15. Scheduled pipeline entrypoints | Complete | Shared CLI foundation plus `ingest`, `build-dataset`, `train`, `backtest`, `explain`, and `publish-signals` commands complete |
+| 16. Data quality, governance & lineage | Complete | Blocking quality gates, `quality_reports`, content-addressed artifacts, lineage capture, live verification, refit reproduction, governance API, read-only console, synthetic demo, browser tests |
 
 ## Sequencing Rules
 
@@ -33,17 +34,18 @@ Extend the validated MVP with production-minded realism improvements, starting w
 
 ## Current Task
 
-Operator UX and deployment readiness hardening.
+Phase 16 delivered. Confirm the new CI steps (PostgreSQL migration round-trip, demo, Playwright job) pass on GitHub Actions.
 
 ## Next Task
 
-Add thin Makefile wrappers and deployment/readiness artifacts around the completed CLI surface.
+Candidates, in priority order: authentication in front of the console before any shared deployment; feature/label drift reports between dataset versions (only where statistically defensible); persisting walk-forward predictions so backtest-level metrics can be bootstrapped.
 
 ## Key Risks
 
 - Package compatibility on Python `3.14`
-- Reproducibility drift if artifact metadata and database metadata diverge
-- Leakage risk if time-aware dataset generation and validation are not enforced centrally
+- Reproducibility drift if artifact metadata and database metadata diverge (mitigated: content-addressed artifacts, live verification, reproduction reports)
+- Leakage risk if time-aware dataset generation and validation are not enforced centrally (mitigated: point-in-time recomputation, label alignment, realized-date embargo checks, walk-forward guard)
+- The console is unauthenticated; it must not be exposed publicly as-is
 - Backtest analytics still exclude benchmark constituent attribution, transaction timing nuance, and multi-strategy comparisons
 - Orchestration must remain thin so command wrappers do not duplicate retry, persistence, or ranking logic already owned by application services
 

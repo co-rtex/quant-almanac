@@ -1,162 +1,257 @@
-# Quant Signal Workstation & Forecasting Pipeline
+# Quant Almanac
 
-Production-minded forecasting platform for daily US equities. The system ingests market data, builds reproducible feature datasets, trains calibrated multi-horizon models, runs regime-aware backtests, generates SHAP explainability artifacts, and serves ranked signals through FastAPI.
+A governed forecasting pipeline for daily US equities. Quant Almanac ingests market data, builds versioned feature datasets, trains calibrated multi-horizon classifiers, runs walk-forward backtests, generates SHAP explanations, and serves ranked signals through FastAPI.
 
-## MVP Scope
+Every stage is gated and traceable. Data-quality checks block bad datasets before training, training gates block leaky splits, every artifact is content-addressed and re-verifiable, and any registered model can be refit from its artifacts to prove it reproduces. A read-only **Model Trust & Lineage Console** shows a reviewer where a model's data came from, which checks it passed, whether its artifacts are intact, and what it cannot claim.
 
-- Daily US equities universe with multi-horizon binary targets for `1D`, `5D`, and `20D`
-- Replaceable market data provider contract with a free development adapter first
-- PostgreSQL-backed metadata registry and normalized market data storage
-- Versioned Parquet feature datasets under `artifacts/`
-- Calibrated probabilistic models, evaluation reporting, walk-forward backtests, and SHAP outputs
-- Read-only FastAPI endpoints for health, model metadata, and ranked signal snapshots
+![Model evidence page](docs/screenshots/console-model.png)
 
-## Repository Layout
+> The screenshots and demo use **synthetic** random-walk data from a seeded generator. They demonstrate the pipeline and its controls. They are not market data or investment performance.
+
+## Why governance
+
+A forecasting pipeline can be technically complete and still untrustworthy. Before this work, the registry recorded artifact hashes, but:
+
+- nothing validated source bars. Duplicate keys, inverted high/low bars, zero prices, and calendar gaps flowed silently into features;
+- rebuilding a dataset, retraining a model, or re-running SHAP **overwrote the artifact an older registry row pointed to**, so its recorded SHA-256 no longer matched and training could read different data than its manifest described;
+- datasets did not record which ingestion runs they came from, and models did not record hyperparameters, library versions, or code revision;
+- nothing checked that labels were aligned to their horizon or that split embargoes actually prevented label overlap;
+- CI had failed on every run since the repository was created, because the migration test migrated the CI PostgreSQL database instead of its own SQLite file.
+
+Quant Almanac now answers seven questions for any model, using only persisted evidence:
+
+1. Which source data was used? (ingestion runs, per-symbol bar provenance, source fingerprint)
+2. How was that data validated? (persisted dataset quality report)
+3. How was the training dataset created and versioned? (content-addressed artifact plus manifest)
+4. Which model configuration and evaluation protocol were used? (hyperparameters, split windows, calibration, selection rule)
+5. Did the experiment pass its correctness gates? (training-gate report, live verification)
+6. What are its limitations? (derived from the evidence, not hand-written)
+7. Can it be reproduced? (refit-and-compare report)
+
+## Architecture
+
+```text
+ provider ──► ingestion run ──► daily_bars ──► [dataset quality gate] ──► dataset artifact (sha-addressed)
+ (yfinance /    (retry, metadata)  (Postgres)     21 checks, blocks on fail      + manifest + lineage
+  synthetic)                                           │                              │
+                                                       ▼                              ▼
+                                               quality_reports  ◄────────── [training gate] ──► model artifacts
+                                               (append-only evidence:        integrity, split,       + config
+                                                dataset_build / training /   label-horizon embargo   + provenance
+                                                reproduction)                       │
+                                                       ▲                            ▼
+                                                       │            evaluations ─ backtests (walk-forward guard)
+                                          reproduce-model ◄──────── signals ───── SHAP runs (sha-addressed)
+                                                                           │
+                              GovernanceService (lineage · live verification · limitations)
+                                     │                         │
+                         /v1/governance/* JSON API     /console (server-rendered, read-only)
+```
+
+| Package | Responsibility |
+| --- | --- |
+| `quant_signal.quality` | Versioned policy (`dq_v1`), typed check results, bar/dataset/training checks, artifact integrity |
+| `quant_signal.governance` | Lineage assembly, live verification, refit-based reproduction, AUC intervals, derived limitations |
+| `quant_signal.console` + `api/routes/console.py` | Jinja2 templates, view-model chart geometry, stylesheet |
+| `quant_signal.api.routes.governance` | Read-only JSON endpoints with 404s for unknown ids |
+| `quant_signal.ingestion.synthetic` | Seeded, window-invariant synthetic provider with documented defect injection |
+| `quant_signal.demo` | `quant-almanac-demo`: the reproducible end-to-end demonstration |
+
+The existing ingestion, feature, training, backtesting, explainability, and serving packages are unchanged in contract. They now call the gates and record lineage. See [ARCHITECTURE.md](ARCHITECTURE.md) for decisions and tradeoffs, and [docs/case-study.md](docs/case-study.md) for the engineering write-up.
+
+## Data-quality checks
+
+Every check records its observed values, thresholds, and up to five offending rows. **Fail** blocks downstream use. **Warn** is recorded and surfaced as a model limitation. Thresholds live in a versioned `DataQualityPolicy` that is persisted with each report.
+
+| Stage | Check | Blocks | Notes |
+| --- | --- | --- | --- |
+| Source bars | `bars.schema`, `bars.required_values` | yes | Required OHLCV columns; finite values |
+| | `bars.duplicate_keys` | yes | One row per (symbol, session) across **all** providers |
+| | `bars.session_dates` | yes | Weekday sessions, nothing after the as-of date |
+| | `bars.positive_prices`, `bars.ohlc_consistency` | yes | `low ≤ open/close ≤ high` with tolerance |
+| | `bars.volume` | negative only | Zero volume warns: trading halts are legitimate |
+| | `bars.symbol_coverage` | yes | Every requested symbol and the benchmark have bars |
+| | `bars.calendar_alignment` | > 5% gap | Measured inside each symbol's own range, so IPOs and delistings are not penalized |
+| | `bars.trailing_coverage`, `bars.extreme_returns`, `bars.stale_prices` | no | Stale feeds, \|return\| > 40%, and frozen prices are flagged for review, not rejected |
+| Dataset | `dataset.schema`, `dataset.unique_keys`, `dataset.temporal_bounds`, `dataset.non_finite_features` | yes | Features and labels disjoint; no infinities (they break imputation) |
+| | `dataset.label_alignment` | yes | Recomputes every forward return from adjusted closes: labels are exactly t+h, none in the final h sessions |
+| | `dataset.point_in_time_features` | yes | **Look-ahead test.** Recomputes all features from history truncated at three cutoffs and requires identical values |
+| | `dataset.feature_target_leakage` | no | \|corr\| ≥ 0.98 with a same-row forward return. This is a heuristic, so it warns. The point-in-time test is the proof |
+| | `dataset.feature_missingness`, `dataset.label_availability` | partly | Post-warmup nulls; labeled rows and both classes per horizon |
+| Training | `training.dataset_artifact_integrity` | yes | SHA-256 of the parquet artifact must match the manifest |
+| | `training.dataset_quality_gate` | on fail | A legacy dataset with no report trains with a recorded warning |
+| | `training.split_ordering`, `training.label_horizon_embargo` | yes | Every train/validation label must be **realized** (per symbol, t+h) before the next split starts |
+| | `training.split_class_coverage` | single class | Small splits warn |
+| Backtest | walk-forward guard | aborts run | Each monthly refit's latest realized label must precede the scored month |
+| All consumers | artifact integrity | yes | Backtest, SHAP, and signal publication refuse modified artifacts |
+
+## Experiment lineage
+
+No new source-of-truth tables. Lineage reuses existing records and adds one evidence table:
+
+- **`dataset_versions.metadata_json.lineage`**: source-bar fingerprint (canonical SHA-256 over every bar read), per-symbol × source × ingestion-run counts and date ranges, the ingestion run ids, feature-builder and label definitions, git commit and dirty flag, Python and library versions.
+- **`model_versions.metadata_json`**: `training_config` (pipeline steps and scalar hyperparameters, split method and session counts, embargo, calibration, selection rule), `governance` (training and dataset report ids, dataset hash at training time), and `provenance`.
+- **`backtest_runs.metadata_json`**: dataset and model hashes at run time, plus walk-forward guard evidence. **SHAP summaries** record the evaluation window, sampling seed, background rows, and hashes.
+- **`quality_reports`** (migration `20261116_0002`): append-only evidence for `dataset_build`, `training`, and `reproduction`. This is the only home for evidence about **blocked** builds, which by design have no dataset row.
+- **Content-addressed artifacts**: dataset, model, and SHAP filenames embed their SHA-256 prefix, so an artifact referenced by a registry row is never overwritten.
+
+Historical records are never back-filled. Anything a legacy record did not capture renders as **Unavailable**.
+
+**Live verification** (`verify-model`, `/verification`, and every console page load) re-hashes every artifact, reopens the model bundle and compares it with the registry, re-fingerprints source bars to detect re-ingestion drift, recomputes the label-horizon embargo from the dataset artifact, and checks gate reports, code revision, and runtime versions.
+
+**Reproduction** (`reproduce-model`) rebuilds the split from the immutable dataset artifact, confirms the code still builds the recorded hyperparameters, refits the model family, and compares test predictions and metrics with the registered model. The result is persisted as a `reproduction` report.
+
+## Reproduce the demonstration
+
+Requires Python 3.14. No credentials, Docker, or network data feed are needed: the demo uses SQLite and the synthetic provider.
+
+```bash
+python3.14 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+```bash
+quant-almanac-demo run
+```
+
+```bash
+quant-almanac-demo serve
+```
+
+`run` migrates a fresh database with Alembic and then drives the real `quant-signal-pipeline` CLI. It ingests five synthetic tickers plus `BADQ`, a ticker with documented injected defects. It builds a clean dataset, which passes. It attempts a build that includes `BADQ` and **asserts that the gate blocks it**. It trains 1d/5d/20d candidates, backtests and explains the 5d champion, reproduces it, and verifies it. The run fails if any expected outcome, including the expected failure, does not occur. It writes `demo/demo_summary.json`.
+
+`serve` starts the console on `http://127.0.0.1:8000/console`. It binds to loopback on purpose: the console has no authentication. Do not expose it publicly without adding auth.
+
+| Console view | Screenshot |
+| --- | --- |
+| Models and quality reports, including the blocked build | [console-index.png](docs/screenshots/console-index.png) |
+| Model evidence: lineage, live verification, limitations, gates, evaluation, backtest, SHAP, reproducibility | [console-model.png](docs/screenshots/console-model.png) |
+| Blocked dataset build report | [console-blocked-build.png](docs/screenshots/console-blocked-build.png) |
+
+Governance commands work against any deployment:
+
+```bash
+quant-signal-pipeline quality-reports --status fail
+```
+
+```bash
+quant-signal-pipeline verify-model --model-version-id <id>
+```
+
+```bash
+quant-signal-pipeline reproduce-model --model-version-id <id>
+```
+
+`verify-model` and `reproduce-model` exit non-zero on a failing verdict, so they can gate CI or a scheduler. A blocked `build-dataset` exits 1 and its JSON error carries `quality_report_id` and the failed check ids.
+
+### API
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /v1/governance/models` | Models with their stored dataset and training gate status |
+| `GET /v1/governance/models/{id}/lineage` | Persisted lineage chain |
+| `GET /v1/governance/models/{id}/verification` | Live re-verification (not persisted) |
+| `GET /v1/governance/models/{id}/evidence` | Lineage, verification, stage statuses, and limitations |
+| `GET /v1/governance/quality-reports?stage=&status=` | Evidence, including blocked builds |
+| `GET /v1/governance/quality-reports/{id}` | One report with every check |
+| `GET /v1/governance/datasets/{id}/quality` | A dataset manifest and its reports |
+
+Unknown ids return 404. Console responses carry a strict CSP (`default-src 'none'`). Pages contain no JavaScript, and all persisted text is HTML-escaped.
+
+## What has been verified
+
+Commands executed for this change (Python 3.14.6, Linux):
+
+| Check | Result |
+| --- | --- |
+| `ruff check src tests` | pass |
+| `mypy src` (strict) | pass, 68 source files |
+| `pytest` | 111 passed (52 pre-existing + 59 new) with Chromium available; without a browser the 2 browser tests skip with an explicit reason |
+| `pytest tests/e2e` (Playwright + Chromium) | 3 passed: index → model → expand evidence → blocked report, phone-width layout, demo summary |
+| Alembic `upgrade head → downgrade 20260316_0001 → upgrade head` | pass on SQLite (test) and PostgreSQL 16 (manual) |
+| Full governed flow on PostgreSQL 16 | pass build, blocked build, train, backtest guard, SHAP, reproduction `pass`, verification with no failures |
+| `quant-almanac-demo run` | all steps as expected; reproduction max \|Δp\| = 0 on 905 test rows |
+
+The CI workflow now also runs the migration round-trip on PostgreSQL 17, the demo, and a separate Playwright job. Those CI steps had not executed when this README was written.
+
+What the demo does **not** show: predictive skill. On random-walk data the 5d champion's test ROC-AUC is 0.401 (approx. 95% CI 0.363–0.439), below chance after a regime shift. The console reports this as a high-severity limitation and marks the evaluation stage as a warning, which is the point.
+
+## Limitations
+
+- The console is read-only and unauthenticated. It is meant for local or private-network review.
+- Lineage is captured from this change forward. Older registry rows show "Unavailable" and are not back-filled.
+- `daily_bars.ingestion_run_id` is last-writer-wins. A dataset records the run ids that were current at build time. Later re-ingestion is detected by the source-fingerprint check rather than preserved row by row.
+- The point-in-time test samples three cutoffs. It proves causality for those truncations, not for every date.
+- AUC intervals use Hanley–McNeil, which assumes independent observations. Overlapping multi-day labels make the true interval wider, and the console says so.
+- Reproduction is exact within one runtime. Library upgrades are flagged by version comparison and may change predictions within numerical tolerance.
+- Universe selection is fixed at build time, so survivorship bias is possible. Champion selection uses a single embargoed holdout. Backtests are simplified long-only equal-weight simulations.
+
+## Pipeline CLI reference
+
+```bash
+quant-signal-pipeline ingest --start-date 2024-01-02 --end-date 2024-05-31 --symbols AAPL
+```
+
+```bash
+quant-signal-pipeline build-dataset --as-of-date 2024-05-31 --symbols AAPL
+```
+
+```bash
+quant-signal-pipeline train --dataset-version-id <dataset-version-id> --horizon 1 --horizon 5
+```
+
+```bash
+quant-signal-pipeline backtest --model-version-id <model-version-id> --top-n 1 --transaction-cost-bps 5 --slippage-bps 2
+```
+
+```bash
+quant-signal-pipeline explain --model-version-id <model-version-id> --sample-size 8 --top-signals 3
+```
+
+```bash
+quant-signal-pipeline publish-signals --model-version-id <model-version-id>
+```
+
+Each command delegates to a service (`IngestionService`, `FeaturePipeline`, `TrainingService`, `BacktestService`, `ExplainabilityService`, `GovernanceService`), prints a JSON summary, and emits a compact JSON error with exit code 1 on failure. `train`, `backtest`, `explain`, and `publish-signals` require explicit ids and never infer "latest". `--symbols` defaults to `UNIVERSE_SYMBOLS`.
+
+## Local setup with PostgreSQL
+
+```bash
+cp .env.example .env
+```
+
+```bash
+docker compose up -d postgres
+```
+
+```bash
+make migrate
+```
+
+```bash
+make run-api
+```
+
+Set `MARKET_DATA_PROVIDER=synthetic` to use the synthetic generator instead of yfinance. Provider retry settings (`MARKET_DATA_MAX_ATTEMPTS`, `MARKET_DATA_BACKOFF_SECONDS`, `MARKET_DATA_BACKOFF_MULTIPLIER`) and backtest cost settings (`BACKTEST_TRANSACTION_COST_BPS`, `BACKTEST_SLIPPAGE_BPS`) are documented in `.env.example`. Note that `make run-api` binds `0.0.0.0`, so use it only on trusted networks.
+
+## Validation workflow
+
+- `make lint`, `make typecheck`, `make test`, `make validate`
+- `make install-e2e` then `make e2e` for browser tests (or set `PLAYWRIGHT_CHROMIUM_EXECUTABLE`)
+- `make demo` and `make demo-console`
+
+## Repository layout
 
 ```text
 .
-├── alembic/                  # Database migrations
-├── artifacts/                # Local artifact storage (gitignored)
-├── src/quant_signal/         # Application package
-├── tests/                    # Unit and integration tests
-├── ARCHITECTURE.md           # System design and tradeoffs
-├── CHANGELOG.md              # Running delivery log
-├── EXECUTION_PLAN.md         # Living execution plan
-├── Makefile                  # Local developer workflow
-├── docker-compose.yml        # Local PostgreSQL
-└── pyproject.toml            # Packaging, lint, type, and test config
+├── alembic/                  # Database migrations (0001 initial, 0002 quality_reports)
+├── docs/                     # Case study and real console screenshots
+├── src/quant_signal/
+│   ├── quality/              # Data-quality policy, checks, gates, artifact integrity
+│   ├── governance/           # Lineage, verification, reproduction, limitations
+│   ├── console/              # Templates, static CSS, view helpers
+│   └── ...                   # ingestion, features, training, backtesting, explainability, api, cli
+├── tests/                    # unit, integration, e2e (Playwright)
+├── ARCHITECTURE.md · CHANGELOG.md · EXECUTION_PLAN.md
+└── Makefile · docker-compose.yml · pyproject.toml
 ```
-
-## Quick Start
-
-1. Create a virtual environment and install dependencies:
-
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   python -m pip install --upgrade pip
-   python -m pip install -e .[dev]
-   ```
-
-2. Copy environment defaults:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Start PostgreSQL:
-
-   ```bash
-   docker compose up -d postgres
-   ```
-
-4. Run migrations:
-
-   ```bash
-   make migrate
-   ```
-
-5. Start the API:
-
-   ```bash
-   make run-api
-   ```
-
-6. Run a scheduled-friendly ingestion command:
-
-   ```bash
-   quant-signal-pipeline ingest --start-date 2024-01-02 --end-date 2024-05-31 --symbols AAPL
-   ```
-
-7. Build a versioned dataset artifact:
-
-   ```bash
-   quant-signal-pipeline build-dataset --as-of-date 2024-05-31 --symbols AAPL
-   ```
-
-8. Train model candidates from an explicit dataset version:
-
-   ```bash
-   quant-signal-pipeline train --dataset-version-id <dataset-version-id> --horizon 1 --horizon 5
-   ```
-
-9. Run a walk-forward backtest from an explicit model version:
-
-   ```bash
-   quant-signal-pipeline backtest --model-version-id <model-version-id> --top-n 1 --transaction-cost-bps 5 --slippage-bps 2
-   ```
-
-10. Generate SHAP explainability artifacts from an explicit model version:
-
-   ```bash
-   quant-signal-pipeline explain --model-version-id <model-version-id> --sample-size 8 --top-signals 3
-   ```
-
-11. Refresh persisted ranked signal snapshots for an explicit model version:
-
-   ```bash
-   quant-signal-pipeline publish-signals --model-version-id <model-version-id>
-   ```
-
-## Validation Workflow
-
-- `make lint`
-- `make typecheck`
-- `make test`
-- `make validate`
-
-## Pipeline CLI
-
-- `quant-signal-pipeline ingest` is now available as the first thin orchestration command for scheduler-friendly market data ingestion
-- `quant-signal-pipeline build-dataset` now maps directly to `FeaturePipeline` and prints a machine-readable dataset manifest summary with the persisted dataset version ID and artifact reference
-- `quant-signal-pipeline train` now maps directly to `TrainingService` and prints machine-readable model metadata for each persisted trained candidate plus the champion model IDs for the requested horizons
-- `quant-signal-pipeline backtest` now maps directly to `BacktestService` and prints a compact run summary with the persisted backtest run ID, artifact references, resolved execution assumptions, and key return statistics
-- `quant-signal-pipeline explain` now maps directly to `ExplainabilityService` and prints a compact SHAP run summary with the persisted explainability run ID, artifact reference, realized sample size, and summary counts
-- `quant-signal-pipeline publish-signals` now maps directly to `TrainingService.refresh_signal_snapshots(...)` and prints a compact publication summary with the explicit model version, snapshot counts, and published date range
-- The commands delegate directly to `IngestionService`, `FeaturePipeline`, `TrainingService`, `BacktestService`, and `ExplainabilityService`, print JSON summaries on success, emit compact JSON error payloads on failure, and keep retry, dataset, training, backtest, SHAP, and signal publication logic inside the service layer
-- `--symbols` is optional; when omitted, the command uses `UNIVERSE_SYMBOLS` from settings
-- `--feature-set-version` is optional for `build-dataset`; when omitted, the CLI defers to the service default
-- `train` requires an explicit dataset version ID; it does not infer the latest dataset or chain dataset builds automatically
-- `backtest` requires an explicit model version ID; optional `--top-n`, `--transaction-cost-bps`, and `--slippage-bps` override only the persisted service inputs and do not trigger training automatically
-- `explain` requires an explicit model version ID; optional `--sample-size` and `--top-signals` map directly to the existing service inputs without exposing broader SHAP tuning
-- `publish-signals` requires an explicit model version ID; it does not infer champions, latest models, or multi-model fanout, and repeated runs safely replace only that model version's snapshots
-
-## Current Status
-
-The repository now includes the validated platform foundation, database schema, ingestion contract, persisted OHLCV workflow, feature engineering pipeline, versioned dataset artifacts, calibrated model training, cost-aware walk-forward backtesting with benchmark-relative analytics and richer regime context, SHAP explainability artifacts, persisted signal snapshots, and read-only FastAPI endpoints for health, signals, and model metadata.
-
-## Implemented MVP Workflow
-
-1. Ingest benchmark and universe OHLCV data through a provider abstraction.
-2. Materialize reproducible feature datasets as versioned Parquet artifacts with registry metadata in PostgreSQL.
-3. Train baseline `logistic_regression` and `hist_gradient_boosting` candidates per horizon, calibrate probabilities, and rank the champion with `PR-AUC`, `Brier score`, and `ROC-AUC`.
-4. Persist ranked daily signal snapshots for champion models so the API stays read-only.
-5. Run monthly walk-forward backtests with benchmark-relative analytics, cost-aware net returns, richer benchmark regime context, turnover-aware reporting, attribution-ready summaries, and regime-aware attribution slices.
-6. Generate global and local SHAP summaries tied to a concrete model version and evaluation window.
-
-## Provider Configuration
-
-- `MARKET_DATA_PROVIDER` defaults to `yfinance`
-- `MARKET_DATA_MAX_ATTEMPTS` defaults to `1`
-- `MARKET_DATA_BACKOFF_SECONDS` defaults to `1.0`
-- `MARKET_DATA_BACKOFF_MULTIPLIER` defaults to `2.0`
-- Ingestion runs now persist nested request, provider, provider-fetch, and persistence metadata so partial or empty fetches are auditable without schema changes
-- Ingestion failures are classified as transient or permanent at the provider edge, and transient fetch failures now retry deterministically before the run is finalized
-- Runs persist a top-level `retry` block with attempt history, completed-after-retry state, and scheduled backoff values for retryable failed attempts
-
-## Backtest Cost Assumptions
-
-- `BACKTEST_TRANSACTION_COST_BPS` defaults to `0.0`
-- `BACKTEST_SLIPPAGE_BPS` defaults to `0.0`
-- Backtest artifacts now record daily `gross_return`, `transaction_cost`, `slippage_cost`, `net_return`, and `active_sleeves`
-- `portfolio_return` remains available as an alias of `net_return` for backward compatibility
-
-## Backtest Analytics
-
-- Daily backtest artifacts include benchmark-relative fields such as `benchmark_return`, `active_return`, `gross_active_return`, and relative cumulative performance
-- Benchmark regime context now includes the primary trend/volatility regime plus momentum and drawdown dimensions
-- Persisted summaries include benchmark metrics, active-return metrics, and grouped performance slices for `trend_flag`, `volatility_flag`, `momentum_flag`, and `drawdown_bucket`
-- Backtest runs also persist a companion detail artifact with composition-level rows for turnover and benchmark-relative contribution diagnostics
-- Daily backtest artifacts now include `entries_count`, `exits_count`, `holdings_count`, `turnover`, and `turnover_cost`
-- `summary_json` now includes top-level `attribution_metrics` and lifecycle-based `lifecycle_attribution` summaries keyed by `entry`, `held`, and `exit`
-- `regime_summary_json` now includes daily average transaction/slippage/implementation drag fields for the primary regime keys, and `summary_json["attribution_dimension_summaries"]` carries the same daily-grain attribution view for each regime dimension

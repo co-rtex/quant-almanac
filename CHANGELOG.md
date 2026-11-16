@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added — Data Quality, Governance & Lineage
+
+- `quant_signal.quality`: versioned `DataQualityPolicy` (`dq_v1`) and 21 dataset-build checks (source bars + dataset), including point-in-time feature recomputation and forward-return label alignment
+- Blocking dataset quality gate; blocked builds persist evidence and write no artifact or manifest
+- Training gate: dataset artifact integrity, dataset verdict, split ordering, realized-date label-horizon embargo, class coverage
+- `quality_reports` table (migration `20261116_0002`) for `dataset_build`, `training`, and `reproduction` evidence
+- Lineage capture: source-bar fingerprint, per-symbol/source/ingestion-run provenance, hyperparameters, split configuration, code revision, and runtime versions
+- Backtest walk-forward guard and artifact-integrity checks for backtests, SHAP, and signal publication
+- `GovernanceService`: lineage, live verification, refit-based reproduction, Hanley–McNeil AUC intervals, evidence-derived limitations
+- CLI commands `verify-model`, `reproduce-model`, `quality-reports`; gate errors include `quality_report_id`
+- `/v1/governance/*` read-only JSON API and the server-rendered Model Trust & Lineage Console (`/console`) with a strict CSP
+- Deterministic `synthetic` market data provider with documented defect injection, and `quant-almanac-demo` end-to-end demonstration
+- Unit, integration, migration round-trip, and Playwright browser tests; CI steps for PostgreSQL migration round-trip, demo, and browser tests
+
+### Fixed
+
+- Dataset, model, and SHAP artifacts were overwritten on rebuild/retrain/re-run, invalidating hashes recorded by earlier registry rows; artifacts are now content-addressed
+- `GET /v1/models/{id}` returned 500 for unknown ids; it now returns 404
+- Migration tests honored the CI `DATABASE_URL` and inspected an empty SQLite file, which had failed every CI run; they now pin their own database
+- NaN hyperparameters are stored as strings so model metadata is valid JSON on PostgreSQL
+
 ### Added
 
 - Standalone repository bootstrap for the quant forecasting platform
@@ -59,4 +80,4 @@
 
 ### Next
 
-- Operator UX, thin task-runner wrappers, and deployment/readiness hardening
+- Authentication before any shared console deployment; statistically defensible drift reporting

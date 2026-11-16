@@ -39,3 +39,25 @@ jobs:
         run: mypy src
       - name: Test
         run: pytest
+      - name: Migration round-trip (PostgreSQL)
+        run: |
+          alembic upgrade head
+          alembic downgrade 20260316_0001
+          alembic upgrade head
+      - name: Governance demo (synthetic data, end to end)
+        run: quant-almanac-demo run --workdir "$RUNNER_TEMP/quant-almanac-demo"
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev,e2e]
+          playwright install --with-deps chromium
+      - name: Browser tests
+        run: pytest tests/e2e -m e2e
