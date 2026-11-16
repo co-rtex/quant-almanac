@@ -22,6 +22,14 @@ class DataQualityPolicy:
     # Fraction of benchmark sessions a symbol may miss (inside its own active range)
     # before the build is blocked. Any missing session produces a warning.
     max_calendar_gap_fraction: float = 0.05
+    # The benchmark defines the trading calendar, so its own sessions are checked
+    # against weekdays. Exchange holidays remove roughly 3.5-4% of weekdays a year, so
+    # up to 4.5% missing passes; up to 6.5% (or a run of up to 4 consecutive missing
+    # weekdays, e.g. the 2001 four-day closure) warns; more fails.
+    benchmark_missing_weekday_pass: float = 0.045
+    benchmark_missing_weekday_fail: float = 0.065
+    benchmark_max_consecutive_missing_pass: int = 2
+    benchmark_max_consecutive_missing_fail: int = 4
     # Sessions a symbol's last bar may lag the benchmark's last bar before warning.
     max_trailing_lag_sessions: int = 5
     # Absolute adjusted daily return considered extreme. Extreme moves are warnings:
@@ -29,9 +37,9 @@ class DataQualityPolicy:
     extreme_return_threshold: float = 0.40
     # Consecutive identical adjusted closes treated as a stale-feed warning.
     stale_price_run_length: int = 5
-    # Rows per symbol excluded from missingness checks. 21 rows covers the longest
-    # return-based lookback in ``ohlcv_v1`` (20-session windows over 1-day returns).
-    feature_warmup_rows: int = 21
+    # Rows per symbol excluded from missingness checks. 50 rows covers the longest
+    # lookback in ``ohlcv_v1`` (the benchmark's 50-session moving average).
+    feature_warmup_rows: int = 50
     # Post-warmup null fraction (per feature) that produces a warning.
     max_post_warmup_null_fraction: float = 0.05
     # Absolute Pearson correlation between a feature and a same-row forward return

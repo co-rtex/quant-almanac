@@ -49,7 +49,7 @@ def status(report: QualityReport, check_id: str) -> str:
 def test_clean_bars_pass_every_check() -> None:
     report = run(make_bars())
     assert report.status == "pass", report.summary_json()
-    assert len(report.checks) == 12
+    assert len(report.checks) == 13
 
 
 def test_missing_columns_fail_schema_and_short_circuit() -> None:
@@ -145,3 +145,15 @@ def test_extreme_returns_and_stale_runs_warn_without_failing() -> None:
     stale_report = run(stale)
     assert status(stale_report, "bars.stale_prices") == "warn"
     assert stale_report.passed
+
+
+def test_benchmark_calendar_tolerates_holidays_but_fails_large_gaps() -> None:
+    bars = make_bars(periods=120)
+    spy_dates = bars.loc[bars["symbol"] == "SPY", "date"].tolist()
+    holidays = bars[~((bars["symbol"] == "SPY") & bars["date"].isin(spy_dates[30:31]))]
+    assert status(run(holidays), "bars.benchmark_calendar") == "pass"
+    gapped = bars[~((bars["symbol"] == "SPY") & bars["date"].isin(spy_dates[::4]))]
+    report = run(gapped)
+    assert status(report, "bars.benchmark_calendar") == "fail"
+    long_run = bars[~((bars["symbol"] == "SPY") & bars["date"].isin(spy_dates[40:46]))]
+    assert status(run(long_run), "bars.benchmark_calendar") == "fail"

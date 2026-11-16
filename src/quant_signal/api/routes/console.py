@@ -57,18 +57,14 @@ def console_index(
 
     models = service.list_models()
     reports = service.list_quality_reports(limit=50)
-    blocked = [
-        report
-        for report in reports
-        if report["stage"] == "dataset_build" and report["status"] == "fail"
-    ]
+    blocked_count = service.count_quality_reports(stage="dataset_build", status="fail")
     return _render(
         request,
         "index.html",
         {
             "models": models,
             "reports": reports,
-            "blocked": blocked,
+            "blocked_count": blocked_count,
             "dataset_count": len({model["dataset_version_id"] for model in models}),
             "synthetic": any(model["synthetic"] for model in models),
         },

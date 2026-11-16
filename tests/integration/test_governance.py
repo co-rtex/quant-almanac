@@ -322,3 +322,99 @@ def test_model_listing_reports_stored_statuses(tmp_path: Path) -> None:
     assert all(row["synthetic"] for row in rows)
     reloaded = reload_model(env.settings, rows[0]["model_version_id"])
     assert reloaded.id == rows[0]["model_version_id"]
+
+
+def test_zero_volume_halt_warns_but_does_not_block_the_build(tmp_path: Path) -> None:
+    settings = governed_settings(tmp_path)
+    ingest(settings)
+    with session_scope(settings.database_url) as session:
+        bars = session.scalars(
+            select(DailyBar)
+            .join(Symbol)
+            .where(Symbol.symbol == "SYNA")
+            .order_by(DailyBar.trade_date)
+        ).all()
+        bars[100].volume = 0
+    dataset = FeaturePipeline(settings=settings).build_dataset(END, ["SYNA", "SYNB", "SYNC"])
+    with session_scope(settings.database_url) as session:
+        report = StorageRepository(session).get_quality_report(
+            dataset.metadata_json["quality"]["report_id"]
+        )
+        statuses = {check["check_id"]: check["status"] for check in report.checks_json}
+    assert statuses["bars.volume"] == "warn"
+    assert statuses["dataset.non_finite_features"] == "pass"
+    assert dataset.metadata_json["quality"]["status"] == "warn"
+
+
+def test_lineage_stages_reflect_live_tampering_and_drift(tmp_path: Path) -> None:
+    env = build_environment(tmp_path)
+    champion = env.champion()
+    service = GovernanceService(settings=env.settings)
+
+    def stages() -> dict[str, str]:
+        evidence = service.model_evidence(champion.id)
+        return {stage["key"]: stage["status"] for stage in evidence["stages"]}
+
+    assert stages()["ingestion"] == "pass"
+    with session_scope(env.settings.database_url) as session:
+        bar = session.scalars(
+            select(DailyBar).join(Symbol).where(Symbol.symbol == "SYNB").limit(1)
+        ).one()
+        bar.volume = bar.volume + 7
+    assert stages()["ingestion"] == "warn"
+
+    with Path(env.dataset.artifact_path).open("ab") as handle:
+        handle.write(b"tamper")
+    after = stages()
+    assert after["dataset"] == "fail"
+    assert after["evaluation"] in {"warn", "fail"}
+
+
+def test_training_gates_every_horizon_before_fitting_any_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = build_environment(tmp_path, train=False)
+    with pytest.raises(ValueError, match="no labels for horizons"):
+        TrainingService(settings=env.settings).train(env.dataset.id, horizons=[5, 250])
+
+    from quant_signal.quality.report import CheckResult
+    from quant_signal.training import service as training_module
+
+    real_checks = training_module.run_split_checks
+
+    def failing_for_5d(*args: object, **kwargs: object) -> list[CheckResult]:
+        results = real_checks(*args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("horizon") == 5:
+            results.append(CheckResult("training.synthetic_failure", "test", "fail", "forced"))
+        return results
+
+    monkeypatch.setattr(training_module, "run_split_checks", failing_for_5d)
+    with pytest.raises(DataQualityGateError):
+        TrainingService(settings=env.settings).train(env.dataset.id, horizons=[1, 5])
+    with session_scope(env.settings.database_url) as session:
+        assert session.scalar(select(func.count(ModelVersion.id))) == 0
+        reports = StorageRepository(session).list_quality_reports(stage="training")
+    assert sorted((report.horizon_days, report.status) for report in reports) == [
+        (1, "pass"),
+        (5, "fail"),
+    ]
+
+
+def test_backtest_artifacts_are_content_addressed(tmp_path: Path) -> None:
+    env = build_environment(tmp_path)
+    champion = env.champion()
+    service = BacktestService(settings=env.settings)
+    first = service.run(champion.id, top_n=1)
+    second = service.run(champion.id, top_n=1)
+    for run in (first, second):
+        assert run.artifact_hash[:12] in run.artifact_path
+        assert (
+            run.metadata_json["detail_artifact_hash"][:12]
+            in run.metadata_json["detail_artifact_path"]
+        )
+    statuses = {
+        check.check_id: check.status
+        for check in GovernanceService(settings=env.settings).verify_model(champion.id).checks
+    }
+    assert statuses["artifact.backtest_integrity"] == "pass"

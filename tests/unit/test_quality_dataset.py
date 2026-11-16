@@ -142,3 +142,29 @@ def test_dataset_after_as_of_date_fails() -> None:
         "dataset.temporal_bounds",
     )
     assert check.status == "fail"
+
+
+def test_label_span_warns_when_a_symbol_gap_stretches_the_horizon() -> None:
+    bars = make_bars()
+    calendar = sorted(pd.to_datetime(bars.loc[bars["symbol"] == "SPY", "date"]).unique())
+    aaa = bars.index[bars["symbol"] == "AAA"]
+    gapped = bars.drop(aaa[60:63])
+    checks = run_dataset_checks(
+        make_dataset(gapped), FEATURE_COLUMNS, HORIZONS, date(2023, 12, 31), POLICY, calendar
+    )
+    span = by_id(checks, "dataset.label_calendar_span")
+    assert span.status == "warn"
+    assert span.observed["labels_spanning_more_than_h_sessions"]["5d"] > 0
+    clean = run_dataset_checks(
+        make_dataset(bars), FEATURE_COLUMNS, HORIZONS, date(2023, 12, 31), POLICY, calendar
+    )
+    assert by_id(clean, "dataset.label_calendar_span").status == "pass"
+
+
+def test_zero_volume_session_does_not_produce_infinite_features() -> None:
+    bars = make_bars()
+    bars.loc[bars.index[bars["symbol"] == "AAA"][70], "volume"] = 0
+    checks = run_dataset_checks(
+        make_dataset(bars), FEATURE_COLUMNS, HORIZONS, date(2023, 12, 31), POLICY
+    )
+    assert by_id(checks, "dataset.non_finite_features").status == "pass"

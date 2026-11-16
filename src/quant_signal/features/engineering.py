@@ -104,6 +104,13 @@ def build_feature_frame(bars: pd.DataFrame, benchmark_symbol: str) -> pd.DataFra
         lambda series: series.rolling(20, min_periods=20).max()
     )
     frame["drawdown_20d"] = (frame["adjusted_close"] / frame["rolling_max_20d"]) - 1.0
+    # A zero-volume session (trading halt, illiquid name) makes the next day's volume
+    # change and an all-zero 20-day mean undefined. Encode them as missing, which the
+    # model pipelines impute, instead of +/-inf, which would make the dataset unusable.
+    # Rows that previously held inf could never be trained on, so this does not change
+    # any dataset that was trainable before.
+    volume_columns = ["volume_change_1d", "volume_ratio_20d"]
+    frame[volume_columns] = frame[volume_columns].replace([math.inf, -math.inf], math.nan)
 
     benchmark_rows = frame[frame["symbol"] == benchmark_symbol.upper()].copy()
     if benchmark_rows.empty:

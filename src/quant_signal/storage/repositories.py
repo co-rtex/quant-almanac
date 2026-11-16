@@ -574,6 +574,16 @@ class StorageRepository:
         ).limit(limit)
         return list(self.session.execute(statement).scalars())
 
+    def count_quality_reports(self, stage: str | None = None, status: str | None = None) -> int:
+        """Count quality reports with optional stage and status filters."""
+
+        statement = select(func.count(QualityReportRecord.id))
+        if stage is not None:
+            statement = statement.where(QualityReportRecord.stage == stage)
+        if status is not None:
+            statement = statement.where(QualityReportRecord.status == status)
+        return int(self.session.execute(statement).scalar_one())
+
     def summarize_bar_provenance(
         self,
         symbols: Sequence[str],

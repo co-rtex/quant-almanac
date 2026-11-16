@@ -15,7 +15,7 @@ from quant_signal.ingestion.synthetic import SyntheticMarketDataProvider
 from quant_signal.quality import DataQualityGateError
 from quant_signal.serving.service import SignalService
 from quant_signal.storage.db import session_scope
-from quant_signal.storage.models import QualityReportRecord
+from quant_signal.storage.models import ModelVersion, QualityReportRecord
 
 
 @pytest.fixture(scope="module")
@@ -153,3 +153,34 @@ def test_console_escapes_untrusted_report_content(
             restored = session.get(QualityReportRecord, blocked_id)
             assert restored is not None
             restored.summary = original
+
+
+def test_console_renders_partially_recorded_models(
+    client: TestClient,
+    governed: tuple[GovernedEnvironment, str],
+) -> None:
+    env, _ = governed
+    candidate = next(model for model in env.models if model.champion_rank != 1)
+    with session_scope(env.settings.database_url) as session:
+        model = session.get(ModelVersion, candidate.id)
+        assert model is not None
+        original = dict(model.metadata_json)
+        model.metadata_json = {
+            **original,
+            "training_config": {"pipeline_steps": [{"name": "model"}]},
+            "provenance": {"runtime": {}},
+        }
+    try:
+        page = client.get(f"/console/models/{candidate.id}")
+        assert page.status_code == 200
+        assert "Unavailable" in page.text
+        with session_scope(env.settings.database_url) as session:
+            model = session.get(ModelVersion, candidate.id)
+            assert model is not None
+            model.metadata_json = {}
+        assert client.get(f"/console/models/{candidate.id}").status_code == 200
+    finally:
+        with session_scope(env.settings.database_url) as session:
+            model = session.get(ModelVersion, candidate.id)
+            assert model is not None
+            model.metadata_json = original

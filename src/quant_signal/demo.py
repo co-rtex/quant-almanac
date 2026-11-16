@@ -69,13 +69,18 @@ class DemoResult:
         }
 
 
-def demo_environment(workdir: Path) -> dict[str, str]:
-    """Return the environment variables that configure the demo deployment."""
+def demo_environment(workdir: Path, database_url: str | None = None) -> dict[str, str]:
+    """Return the environment variables that configure the demo deployment.
+
+    The default database is a SQLite file in ``workdir``; pass ``database_url`` to run
+    the same demonstration against PostgreSQL (CI does this).
+    """
 
     resolved = workdir.resolve()
     return {
         "APP_ENV": "demo",
-        "DATABASE_URL": f"sqlite+pysqlite:///{resolved / 'quant_almanac_demo.sqlite3'}",
+        "DATABASE_URL": database_url
+        or f"sqlite+pysqlite:///{resolved / 'quant_almanac_demo.sqlite3'}",
         "ARTIFACT_ROOT": str(resolved / "artifacts"),
         "MARKET_DATA_PROVIDER": "synthetic",
         "BENCHMARK_SYMBOL": BENCHMARK,
@@ -89,10 +94,10 @@ def demo_environment(workdir: Path) -> dict[str, str]:
     }
 
 
-def demo_settings(workdir: Path) -> Settings:
+def demo_settings(workdir: Path, database_url: str | None = None) -> Settings:
     """Build explicit settings for the demo (independent of any local .env file)."""
 
-    env = demo_environment(workdir)
+    env = demo_environment(workdir, database_url)
     return Settings(
         _env_file=None,  # type: ignore[call-arg]
         app_env=env["APP_ENV"],
@@ -161,13 +166,22 @@ def _cli(
     return payload
 
 
-def run_demo(workdir: Path = DEFAULT_WORKDIR, reset: bool = True, echo: bool = True) -> DemoResult:
-    """Execute the full demonstration and return its evidence."""
+def run_demo(
+    workdir: Path = DEFAULT_WORKDIR,
+    reset: bool = True,
+    echo: bool = True,
+    database_url: str | None = None,
+) -> DemoResult:
+    """Execute the full demonstration and return its evidence.
+
+    With an external ``database_url`` the database must be empty (``reset`` only
+    clears the local workdir); the demo never drops data it did not create.
+    """
 
     if reset and workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    settings = demo_settings(workdir)
+    settings = demo_settings(workdir, database_url)
     result = DemoResult(workdir=workdir, database_url=settings.database_url)
 
     if echo:
@@ -312,6 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = sub.add_parser("run", help="Run the full pipeline demonstration.")
     run_parser.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     run_parser.add_argument(
+        "--database-url",
+        help="Run against this (empty) database instead of a local SQLite file.",
+    )
+    run_parser.add_argument(
         "--keep",
         action="store_true",
         help="Keep an existing workdir instead of starting from scratch.",
@@ -333,7 +351,7 @@ def run(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "run":
         try:
-            run_demo(args.workdir, reset=not args.keep)
+            run_demo(args.workdir, reset=not args.keep, database_url=args.database_url)
         except DemoError as exc:
             print(f"DEMO FAILED: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc

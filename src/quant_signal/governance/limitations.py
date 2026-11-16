@@ -93,6 +93,17 @@ def derive_limitations(
             )
         )
 
+    if dataset.get("feature_set_version") == "ohlcv_v1":
+        limitations.append(
+            _limitation(
+                "info",
+                "features",
+                "In feature set ohlcv_v1, benchmark_trend and benchmark_high_vol are encoded "
+                "as 0 (not missing) until their 50-session lookbacks fill, so early rows carry "
+                "placeholder values the model cannot distinguish from real ones.",
+            )
+        )
+
     symbols = dataset.get("symbols") or []
     if len(symbols) < 3:
         limitations.append(
@@ -145,6 +156,18 @@ def derive_limitations(
     if backtests:
         latest = backtests[0]
         assumptions = latest.get("execution_assumptions") or {}
+        guard = latest.get("walk_forward_guard") or {}
+        slack = guard.get("min_sessions_between_last_label_and_scoring")
+        if isinstance(slack, int):
+            limitations.append(
+                _limitation(
+                    "medium",
+                    "backtest",
+                    "Each monthly walk-forward refit leaves its newest ~20% of history unused "
+                    "(the split's test partition plus embargoes), so scored months rely on "
+                    f"a model whose newest label is at least {slack} sessions old.",
+                )
+            )
         if not assumptions.get("total_cost_rate_per_side"):
             limitations.append(
                 _limitation(

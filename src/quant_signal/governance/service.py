@@ -150,6 +150,12 @@ class GovernanceService:
             )
         return [quality_report_json(report, include_context=False) for report in reports]
 
+    def count_quality_reports(self, stage: str | None = None, status: str | None = None) -> int:
+        """Count persisted quality reports (e.g. every blocked dataset build)."""
+
+        with session_scope(self.database_url) as session:
+            return StorageRepository(session).count_quality_reports(stage=stage, status=status)
+
     def get_quality_report(self, quality_report_id: str) -> dict[str, Any]:
         """Return one persisted quality report with its full context."""
 
@@ -541,11 +547,26 @@ class GovernanceService:
             split=split,
         )
         test_frame = training_frame[split.mask(training_frame, "test")]
+        if test_frame.empty:
+            results.append(
+                CheckResult(
+                    check_id="reproduction.prediction_equivalence",
+                    category="reproducibility",
+                    status="fail",
+                    message="The rebuilt test split is empty; predictions cannot be compared.",
+                )
+            )
+            return results
         refit_probabilities = refit.predict_positive_proba(test_frame)
         registered_probabilities = bundle.predict_positive_proba(test_frame)
-        max_difference = float(np.max(np.abs(refit_probabilities - registered_probabilities)))
+        prediction_gaps = np.abs(refit_probabilities - registered_probabilities)
+        finite = bool(np.all(np.isfinite(prediction_gaps)))
+        # Non-finite values are reported as strings so the report stays valid JSON.
+        max_difference = float(np.max(prediction_gaps)) if finite else float("inf")
         prediction_status: CheckStatus = (
-            "pass"
+            "fail"
+            if not finite
+            else "pass"
             if max_difference <= PREDICTION_EXACT_TOLERANCE
             else "warn"
             if max_difference <= PREDICTION_NUMERICAL_TOLERANCE
@@ -563,7 +584,10 @@ class GovernanceService:
                     else f"Refit predictions diverge from the registered model "
                     f"(max |Δp| = {max_difference:.2e})."
                 ),
-                observed={"test_rows": int(len(test_frame)), "max_abs_difference": max_difference},
+                observed={
+                    "test_rows": int(len(test_frame)),
+                    "max_abs_difference": max_difference if finite else "non-finite",
+                },
                 threshold={
                     "exact_tolerance": PREDICTION_EXACT_TOLERANCE,
                     "numerical_tolerance": PREDICTION_NUMERICAL_TOLERANCE,

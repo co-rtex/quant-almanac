@@ -108,3 +108,30 @@ def test_chart_geometry_helpers() -> None:
         "test",
     ]
     assert split_timeline(None) == {"available": False}
+
+
+def test_code_revision_counts_untracked_files_and_rejects_foreign_repos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_signal.core import provenance
+
+    package_dir = Path(provenance.__file__).resolve().parents[1]
+    repo_root = str(package_dir.parents[1])
+    answers = {"rev-parse --show-toplevel": repo_root, "rev-parse HEAD": "abc123"}
+
+    def fake_git(args: list[str], cwd: Path) -> str | None:
+        key = " ".join(args)
+        if key.startswith("status"):
+            assert "--untracked-files=no" not in args
+            return "?? src/quant_signal/new_module.py"
+        return answers.get(key)
+
+    monkeypatch.delenv(provenance.CODE_REVISION_ENV, raising=False)
+    monkeypatch.setattr(provenance, "_git", fake_git)
+    assert provenance.code_revision() == {"commit": "abc123", "dirty": True, "source": "git"}
+
+    answers["rev-parse --show-toplevel"] = "/somewhere/else"
+    assert provenance.code_revision()["source"] == "unavailable"
+
+    monkeypatch.setenv(provenance.CODE_REVISION_ENV, "release-1.2")
+    assert provenance.code_revision()["commit"] == "release-1.2"

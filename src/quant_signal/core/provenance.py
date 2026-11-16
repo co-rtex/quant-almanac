@@ -30,24 +30,30 @@ def _git(args: list[str], cwd: Path) -> str | None:
     return completed.stdout.strip()
 
 
-@cache
 def code_revision() -> dict[str, object]:
     """Return the source revision, or an explicit ``unavailable`` marker.
 
     ``QUANT_ALMANAC_CODE_REVISION`` takes precedence so packaged deployments without a
-    ``.git`` directory can still record a revision. The working-tree ``dirty`` flag is
-    only reported when git can determine it; it is never guessed.
+    ``.git`` directory can still record a revision. Git is only trusted when this
+    package lives at ``<repo>/src/quant_signal`` of the reported work tree, so an
+    unrelated enclosing repository is never recorded. The ``dirty`` flag counts
+    modified *and* untracked (non-ignored) files, because a new, untracked module can
+    change behavior. The revision is read on every call (not cached) so long-running
+    processes record the code that is actually on disk when an artifact is produced.
     """
 
     override = os.getenv(CODE_REVISION_ENV)
     if override:
         return {"commit": override.strip(), "dirty": None, "source": "environment"}
 
-    package_dir = Path(__file__).resolve().parent
+    package_dir = Path(__file__).resolve().parents[1]
+    toplevel = _git(["rev-parse", "--show-toplevel"], package_dir)
+    if not toplevel or (Path(toplevel) / "src" / "quant_signal").resolve() != package_dir:
+        return {"commit": None, "dirty": None, "source": "unavailable"}
     commit = _git(["rev-parse", "HEAD"], package_dir)
     if not commit:
         return {"commit": None, "dirty": None, "source": "unavailable"}
-    status = _git(["status", "--porcelain", "--untracked-files=no"], package_dir)
+    status = _git(["status", "--porcelain"], package_dir)
     return {
         "commit": commit,
         "dirty": None if status is None else bool(status),

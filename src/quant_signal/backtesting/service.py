@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 
@@ -229,20 +231,22 @@ class BacktestService:
         regime_summary = self._build_regime_summary(analytics_frame)
         summary_json = self._portfolio_summary(analytics_frame, detail_artifact)
 
-        artifact_path = self._build_artifact_path(
-            model_version_id=model_version_id,
-            top_n=top_n_signals,
-            execution_assumptions=resolved_assumptions,
+        artifact_path, artifact_hash = self._write_content_addressed(
+            analytics_frame,
+            self._build_artifact_path(
+                model_version_id=model_version_id,
+                top_n=top_n_signals,
+                execution_assumptions=resolved_assumptions,
+            ),
         )
-        detail_artifact_path = self._build_detail_artifact_path(
-            model_version_id=model_version_id,
-            top_n=top_n_signals,
-            execution_assumptions=resolved_assumptions,
+        detail_artifact_path, detail_artifact_hash = self._write_content_addressed(
+            detail_artifact,
+            self._build_detail_artifact_path(
+                model_version_id=model_version_id,
+                top_n=top_n_signals,
+                execution_assumptions=resolved_assumptions,
+            ),
         )
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        detail_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        analytics_frame.to_parquet(artifact_path, index=False)
-        detail_artifact.to_parquet(detail_artifact_path, index=False)
 
         with session_scope(self.database_url) as session:
             repository = StorageRepository(session)
@@ -254,7 +258,7 @@ class BacktestService:
                     min_training_days=self.settings.min_training_days,
                     status="completed",
                     artifact_path=str(artifact_path),
-                    artifact_hash=sha256_file(artifact_path),
+                    artifact_hash=artifact_hash,
                     summary_json=summary_json,
                     regime_summary_json=regime_summary,
                     metadata_json={
@@ -266,7 +270,7 @@ class BacktestService:
                         "backtest_analytics_version": BACKTEST_ANALYTICS_VERSION,
                         "backtest_detail_artifact_version": BACKTEST_DETAIL_ARTIFACT_VERSION,
                         "detail_artifact_path": str(detail_artifact_path),
-                        "detail_artifact_hash": sha256_file(detail_artifact_path),
+                        "detail_artifact_hash": detail_artifact_hash,
                         "execution_assumptions": resolved_assumptions.to_metadata_json(),
                         "lineage": {
                             "dataset_version_id": dataset_version.id,
@@ -567,6 +571,22 @@ class BacktestService:
                 "execution_assumptions": execution_assumptions.to_metadata_json(),
             }
         )[:12]
+
+    def _write_content_addressed(self, frame: pd.DataFrame, base_path: Path) -> tuple[Path, str]:
+        """Write a parquet artifact whose filename embeds its SHA-256 prefix.
+
+        The configuration fingerprint keeps names readable; the digest guarantees that
+        re-running a backtest (e.g. after an analytics change) never overwrites the file
+        an earlier ``backtest_runs`` row references.
+        """
+
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = base_path.with_name(f".{base_path.stem}_{uuid4().hex}.parquet.tmp")
+        frame.to_parquet(temporary, index=False)
+        artifact_hash = sha256_file(temporary)
+        final_path = base_path.with_name(f"{base_path.stem}_{artifact_hash[:12]}.parquet")
+        os.replace(temporary, final_path)
+        return final_path, artifact_hash
 
     def _build_artifact_path(
         self,

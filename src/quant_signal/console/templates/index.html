@@ -14,8 +14,8 @@
 <div class="stats">
   <div class="stat"><div class="stat-label">Registered models</div><div class="stat-value" data-testid="model-count">{{ models|length }}</div><div class="stat-note">candidates and champions</div></div>
   <div class="stat"><div class="stat-label">Dataset versions</div><div class="stat-value">{{ dataset_count }}</div><div class="stat-note">with trained models</div></div>
-  <div class="stat"><div class="stat-label">Quality reports</div><div class="stat-value">{{ reports|length }}</div><div class="stat-note">most recent 50</div></div>
-  <div class="stat"><div class="stat-label">Blocked dataset builds</div><div class="stat-value" data-testid="blocked-count">{{ blocked|length }}</div><div class="stat-note">rejected by the quality gate</div></div>
+  <div class="stat"><div class="stat-label">Quality reports</div><div class="stat-value">{{ reports|length }}</div><div class="stat-note">{{ 'most recent 50 listed' if reports|length == 50 else 'all listed below' }}</div></div>
+  <div class="stat"><div class="stat-label">Blocked dataset builds</div><div class="stat-value" data-testid="blocked-count">{{ blocked_count }}</div><div class="stat-note">rejected by the quality gate</div></div>
 </div>
 
 <section class="card" aria-labelledby="models-heading">

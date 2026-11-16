@@ -158,18 +158,19 @@
         {% for name in ['train', 'validation', 'test'] %}
         <dt>{{ name|capitalize }}</dt><dd>{{ m.windows[name].start or '—' }} → {{ m.windows[name].end or '—' }}</dd>
         {% endfor %}
-        {% if m.training_config %}
-        <dt>Embargo</dt><dd>{{ m.training_config.split.embargo_days }} sessions (= horizon)</dd>
-        <dt>Calibration</dt><dd>{{ m.training_config.calibration.method }} on {{ m.training_config.calibration.fit_on }}</dd>
-        <dt>Champion rule</dt><dd>{{ m.training_config.champion_selection }}</dd>
-        {% endif %}
+        {% set tc = m.training_config or {} %}
+        {% set tc_split = tc.get('split') or {} %}
+        {% set tc_cal = tc.get('calibration') or {} %}
+        <dt>Embargo</dt><dd>{% if tc_split.get('embargo_days') is not none %}{{ tc_split.get('embargo_days') }} sessions (= horizon){% else %}Unavailable{% endif %}</dd>
+        <dt>Calibration</dt><dd>{% if tc_cal.get('method') %}{{ tc_cal.get('method') }} on {{ tc_cal.get('fit_on', '—') }}{% else %}Unavailable{% endif %}</dd>
+        <dt>Champion rule</dt><dd>{{ tc.get('champion_selection') or 'Unavailable' }}</dd>
       </dl>
     </div>
     <div>
       <h3>Pipeline &amp; hyperparameters</h3>
-      {% if m.training_config %}
+      {% if (m.training_config or {}).get('pipeline_steps') %}
       {% for step in m.training_config.pipeline_steps %}
-      <details class="evidence"><summary>{{ step.name }} · {{ step['class'] }}</summary><pre>{{ step.params|pretty }}</pre></details>
+      <details class="evidence"><summary>{{ step.get('name', '?') }} · {{ step.get('class', '?') }}</summary><pre>{{ step.get('params', {})|pretty }}</pre></details>
       {% endfor %}
       {% else %}
       <p class="empty">Unavailable — hyperparameters were not recorded for this model.</p>
@@ -300,7 +301,7 @@
     <div class="card-head">
       <div>
         <h2 id="shap-heading">Explanations (SHAP)</h2>
-        <p class="section-note">{% if latest_shap and latest_shap.methodology %}Mean |SHAP| on the calibrated probability over {{ latest_shap.sample_size }} sampled test rows ({{ latest_shap.methodology.evaluation_window.start_date }} → {{ latest_shap.methodology.evaluation_window.end_date }}).{% elif latest_shap %}Mean |SHAP| over {{ latest_shap.sample_size }} test rows (methodology not recorded).{% else %}No explainability runs recorded.{% endif %}</p>
+        <p class="section-note">{% if latest_shap and (latest_shap.methodology or {}).get('evaluation_window') %}{% set window = latest_shap.methodology.evaluation_window %}Mean |SHAP| on the calibrated probability over {{ latest_shap.sample_size }} sampled test rows ({{ window.get('start_date', '?') }} → {{ window.get('end_date', '?') }}).{% elif latest_shap %}Mean |SHAP| over {{ latest_shap.sample_size }} test rows (methodology not recorded).{% else %}No explainability runs recorded.{% endif %}</p>
       </div>
     </div>
     {% if importance and importance.bars %}
@@ -319,7 +320,7 @@
       <tbody>
       {% for row in latest_shap.local_explanations %}
       <tr><td>{{ row.date }}</td><td>{{ row.symbol }}</td><td class="num">{{ row.score|num }}</td>
-        <td>{% for c in row.top_contributors[:3] %}<code>{{ c.feature }}</code> {{ '%+.4f'|format(c.shap_value) }}{% if not loop.last %}, {% endif %}{% endfor %}</td></tr>
+        <td>{% for c in (row.top_contributors or [])[:3] %}<code>{{ c.feature }}</code> {{ c.shap_value|num(4) }}{% if not loop.last %}, {% endif %}{% endfor %}</td></tr>
       {% endfor %}
       </tbody>
     </table></div>
@@ -346,9 +347,11 @@
         <dt>Model artifact</dt><dd class="hash">{{ m.artifact_sha256 }}</dd>
         <dt>Dataset artifact</dt><dd class="hash">{{ d.artifact_sha256 }}</dd>
         {% if m.provenance %}
-        <dt>Commit</dt><dd class="hash">{{ m.provenance.code.commit or 'Unavailable' }}{% if m.provenance.code.dirty %} (uncommitted changes){% endif %}</dd>
-        <dt>Python</dt><dd>{{ m.provenance.runtime.python }}</dd>
-        <dt>Libraries</dt><dd>{% for name, version in m.provenance.runtime.packages|dictsort %}{{ name }} {{ version or '—' }}{% if not loop.last %} · {% endif %}{% endfor %}</dd>
+        {% set code = m.provenance.get('code') or {} %}
+        {% set runtime = m.provenance.get('runtime') or {} %}
+        <dt>Commit</dt><dd class="hash">{{ code.get('commit') or 'Unavailable' }}{% if code.get('dirty') %} (uncommitted changes){% endif %}</dd>
+        <dt>Python</dt><dd>{{ runtime.get('python') or 'Unavailable' }}</dd>
+        <dt>Libraries</dt><dd>{% for name, version in (runtime.get('packages') or {})|dictsort %}{{ name }} {{ version or '—' }}{% if not loop.last %} · {% endif %}{% else %}Unavailable{% endfor %}</dd>
         {% else %}
         <dt>Code &amp; runtime</dt><dd>Unavailable — not recorded for this model.</dd>
         {% endif %}

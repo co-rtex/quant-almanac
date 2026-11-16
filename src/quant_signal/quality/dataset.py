@@ -21,8 +21,13 @@ def run_dataset_checks(
     horizons: Sequence[int],
     as_of_date: date,
     policy: DataQualityPolicy,
+    calendar: Sequence[pd.Timestamp] | None = None,
 ) -> list[CheckResult]:
-    """Run label, leakage, and missingness checks on a materialized dataset frame."""
+    """Run label, leakage, and missingness checks on a materialized dataset frame.
+
+    ``calendar`` is the benchmark's session list; when given, labels are also checked
+    for spanning more than ``h`` market sessions (which happens across symbol gaps).
+    """
 
     schema = check_dataset_schema(dataset, feature_columns, horizons)
     if schema.status == "fail":
@@ -38,6 +43,7 @@ def run_dataset_checks(
         check_non_finite_features(frame, feature_columns),
         check_feature_missingness(frame, feature_columns, policy),
         check_label_alignment(frame, horizons),
+        *([check_label_calendar_span(frame, horizons, calendar)] if calendar is not None else []),
         check_label_availability(frame, horizons),
         check_feature_target_leakage(frame, feature_columns, horizons, policy),
     ]
@@ -209,11 +215,13 @@ def check_feature_missingness(
 
 
 def check_label_alignment(frame: pd.DataFrame, horizons: Sequence[int]) -> CheckResult:
-    """Labels must be exactly the h-session-forward return of the same symbol.
+    """Labels must equal the forward return h rows ahead in each symbol's own history.
 
-    Recomputing forward returns from the persisted adjusted closes proves that labels
-    are aligned to t+h (not t+h-1 or t+h+1), that no label exists for sessions whose
-    outcome is after the dataset end, and that binary targets agree with returns.
+    Recomputing from the persisted adjusted closes guards the artifact against labels
+    produced by different (e.g. off-by-one) code or edited after the build, confirms
+    no label exists in a symbol's final h rows, and that targets agree with returns.
+    It does not, on its own, prove that h rows equal h market sessions; see
+    ``check_label_calendar_span`` for that.
     """
 
     mismatches: dict[str, int] = {}
@@ -253,8 +261,8 @@ def check_label_alignment(frame: pd.DataFrame, horizons: Sequence[int]) -> Check
         message=(
             "Labels are not aligned to the declared forward horizons."
             if failed
-            else "Every label equals the recomputed h-session forward return; "
-            "no label extends beyond the available history."
+            else "Every label equals the recomputed h-row forward return in its symbol's "
+            "history; no label extends beyond the available history."
         ),
         observed={
             "forward_return_mismatches": mismatches,
@@ -263,6 +271,54 @@ def check_label_alignment(frame: pd.DataFrame, horizons: Sequence[int]) -> Check
             "horizons": list(horizons),
         },
         examples=example_rows,
+    )
+
+
+def check_label_calendar_span(
+    frame: pd.DataFrame,
+    horizons: Sequence[int],
+    calendar: Sequence[pd.Timestamp],
+) -> CheckResult:
+    """Warn when a label spans more than h benchmark sessions (a symbol gap inside it).
+
+    Labels are built h rows ahead per symbol; if a symbol skipped sessions, a nominal
+    5-day label measures a longer period. Calendar gaps above the policy limit already
+    fail the build, so the remaining cases are warnings with counts per horizon.
+    """
+
+    sessions = pd.DatetimeIndex(sorted(pd.to_datetime(list(calendar))))
+    stretched: dict[str, int] = {}
+    examples_rows: list[dict[str, object]] = []
+    for horizon in horizons:
+        labeled = frame[frame[f"forward_return_{horizon}d"].notna()]
+        realized = frame.groupby("symbol", sort=False)["date"].shift(-horizon).loc[labeled.index]
+        valid = realized.notna()
+        start = sessions.searchsorted(labeled.loc[valid, "date"])
+        end = sessions.searchsorted(realized[valid])
+        spans = pd.Series(end - start, index=labeled.index[valid])
+        too_long = spans[spans > horizon]
+        if len(too_long):
+            stretched[f"{horizon}d"] = int(len(too_long))
+            for index in too_long.index[:2]:
+                examples_rows.append(
+                    {
+                        "horizon": f"{horizon}d",
+                        "symbol": str(frame.at[index, "symbol"]),
+                        "date": pd.Timestamp(frame.at[index, "date"]).date().isoformat(),
+                        "sessions_spanned": int(too_long[index]),
+                    }
+                )
+    return CheckResult(
+        check_id="dataset.label_calendar_span",
+        category="labels",
+        status="warn" if stretched else "pass",
+        message=(
+            f"Some labels span more than h market sessions because of symbol gaps: {stretched}."
+            if stretched
+            else "Every label spans exactly h benchmark sessions."
+        ),
+        observed={"labels_spanning_more_than_h_sessions": stretched},
+        examples=examples_rows,
     )
 
 

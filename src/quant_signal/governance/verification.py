@@ -364,13 +364,40 @@ def lineage_stages(lineage: dict[str, Any], verification: QualityReport) -> list
     explanations = lineage["explanations"]
     dataset_report = lineage["dataset_quality_report"]
     training_report = lineage["training_quality_report"]
-    # The evaluation hop reflects both record integrity and what the evidence supports:
-    # a test AUC whose interval reaches 0.5 (or lies below it) is flagged, not "passed".
+    # Every hop combines its build-time verdict with the live checks that cover it, so a
+    # tampered artifact or drifted source can never sit next to a green hop.
+    check_ids = {str(check["check_id"]) for check in checks}
+    ingestion_status = status_of(checks, "lineage.ingestion_runs", "lineage.source_bar_fingerprint")
+    source_status = (
+        "unavailable"
+        if not providers
+        else worst_status(["warn" if lineage["synthetic"] else "pass", ingestion_status])
+        if ingestion_status != "unavailable"
+        else ("warn" if lineage["synthetic"] else "unavailable")
+    )
+    dataset_integrity = status_of(checks, "artifact.dataset_integrity")
+    dataset_status: str
+    if dataset_report:
+        dataset_status = worst_status([dataset_report["status"], dataset_integrity])
+    else:
+        dataset_status = "fail" if dataset_integrity == "fail" else "unavailable"
+    training_status = (
+        worst_status([training_report["status"], status_of(checks, "quality.training_gate")])
+        if training_report
+        else "unavailable"
+    )
+    # The evaluation hop reflects record integrity, a recomputed embargo, and what the
+    # evidence supports: a test AUC whose interval reaches or falls below 0.5 is flagged.
     evaluation_status = status_of(
         checks, "evaluation.splits_recorded", "evaluation.split_boundaries"
     )
+    if "evaluation.split_boundaries" not in check_ids:
+        evaluation_status = worst_status([evaluation_status, "warn"])
     interval = test.get("roc_auc_interval") if test else None
     evaluation_detail = f"n = {test['sample_count']}" if test else ""
+    if test and not interval:
+        evaluation_status = worst_status([evaluation_status, "warn"])
+        evaluation_detail += " · no interval"
     if interval and (interval["includes_chance"] or interval["upper_95"] < 0.5):
         evaluation_status = worst_status([evaluation_status, "warn"])
         evaluation_detail += (
@@ -380,14 +407,14 @@ def lineage_stages(lineage: dict[str, Any], verification: QualityReport) -> list
         {
             "key": "source",
             "title": "Source",
-            "status": "warn" if lineage["synthetic"] else ("pass" if providers else "unavailable"),
+            "status": source_status,
             "headline": ", ".join(providers) if providers else "Unavailable",
             "detail": "Synthetic fixture data" if lineage["synthetic"] else "Market data provider",
         },
         {
             "key": "ingestion",
             "title": "Ingestion",
-            "status": status_of(checks, "lineage.ingestion_runs"),
+            "status": ingestion_status,
             "headline": f"{len(runs)} run{'s' if len(runs) != 1 else ''}"
             if runs
             else "Unavailable",
@@ -398,14 +425,14 @@ def lineage_stages(lineage: dict[str, Any], verification: QualityReport) -> list
         {
             "key": "dataset",
             "title": "Dataset",
-            "status": dataset_report["status"] if dataset_report else "unavailable",
+            "status": dataset_status,
             "headline": f"{dataset['row_count']:,} rows",
             "detail": f"{date_range.get('start', '?')} → {date_range.get('end', '?')}",
         },
         {
             "key": "training_gate",
             "title": "Training gate",
-            "status": training_report["status"] if training_report else "unavailable",
+            "status": training_status,
             "headline": f"{model['horizon_days']}d horizon",
             "detail": "Split + embargo checks" if training_report else "Not recorded",
         },

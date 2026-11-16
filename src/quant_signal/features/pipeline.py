@@ -138,6 +138,11 @@ class FeaturePipeline:
                         horizons,
                         as_of_date,
                         policy,
+                        calendar=list(
+                            pd.to_datetime(
+                                bars.loc[bars["symbol"] == benchmark_symbol, "date"]
+                            ).unique()
+                        ),
                     ),
                     check_point_in_time_features(
                         bars=bars,

@@ -78,6 +78,7 @@ def run_bar_checks(
         check_ohlc_consistency(frame, policy),
         check_volume(frame),
         check_symbol_coverage(frame, modeling_symbols, benchmark_symbol),
+        check_benchmark_calendar(frame, benchmark_symbol, policy),
         check_calendar_alignment(frame, modeling_symbols, benchmark_symbol, policy),
         check_trailing_coverage(frame, modeling_symbols, benchmark_symbol, policy),
         check_extreme_returns(frame, policy),
@@ -275,6 +276,77 @@ def check_symbol_coverage(
         ),
         observed={"missing_symbols": missing, "per_symbol": coverage},
         threshold={"expected_symbols": expected},
+    )
+
+
+def check_benchmark_calendar(
+    frame: pd.DataFrame,
+    benchmark_symbol: str,
+    policy: DataQualityPolicy,
+) -> CheckResult:
+    """The benchmark's sessions define the calendar, so they are checked against weekdays.
+
+    Every other symbol's gaps are measured against the benchmark; without this check a
+    benchmark with missing sessions would silently become the ground truth and its
+    context features would span the wrong windows.
+    """
+
+    sessions = pd.DatetimeIndex(
+        sorted(frame.loc[frame["symbol"] == benchmark_symbol, "date"].unique())
+    )
+    if sessions.empty:
+        return CheckResult(
+            check_id="bars.benchmark_calendar",
+            category="coverage",
+            status="fail",
+            message="The benchmark has no bars, so the trading calendar is undefined.",
+        )
+    weekdays = pd.bdate_range(sessions.min(), sessions.max())
+    missing = weekdays.difference(sessions)
+    fraction = float(len(missing) / len(weekdays)) if len(weekdays) else 0.0
+    longest_run = 0
+    if len(missing):
+        positions = weekdays.get_indexer(missing)
+        breaks = np.concatenate([[True], np.diff(positions) != 1])
+        run_ids = np.cumsum(breaks)
+        longest_run = int(np.bincount(run_ids).max())
+    status: CheckStatus
+    if (
+        fraction > policy.benchmark_missing_weekday_fail
+        or longest_run > policy.benchmark_max_consecutive_missing_fail
+    ):
+        status = "fail"
+    elif (
+        fraction > policy.benchmark_missing_weekday_pass
+        or longest_run > policy.benchmark_max_consecutive_missing_pass
+    ):
+        status = "warn"
+    else:
+        status = "pass"
+    return CheckResult(
+        check_id="bars.benchmark_calendar",
+        category="coverage",
+        status=status,
+        message=(
+            f"The benchmark is missing {fraction:.1%} of weekdays (longest run {longest_run}); "
+            "more than exchange holidays explain."
+            if status != "pass"
+            else f"The benchmark calendar is consistent with exchange holidays "
+            f"({fraction:.1%} of weekdays missing, longest run {longest_run})."
+        ),
+        observed={
+            "weekdays": int(len(weekdays)),
+            "missing_weekdays": int(len(missing)),
+            "missing_fraction": round(fraction, 6),
+            "longest_missing_run": longest_run,
+        },
+        threshold={
+            "pass_fraction": policy.benchmark_missing_weekday_pass,
+            "fail_fraction": policy.benchmark_missing_weekday_fail,
+            "pass_run": policy.benchmark_max_consecutive_missing_pass,
+            "fail_run": policy.benchmark_max_consecutive_missing_fail,
+        },
+        examples=[{"missing_date": _json_scalar(value)} for value in list(missing[:5])],
     )
 
 

@@ -132,6 +132,12 @@ class TrainingService:
             )
 
         requested_horizons = list(horizons or dataset_version.horizons)
+        unknown_horizons = sorted(set(requested_horizons) - set(dataset_version.horizons))
+        if unknown_horizons:
+            raise ValueError(
+                f"Dataset {dataset_version.id} has no labels for horizons {unknown_horizons}; "
+                f"available horizons: {sorted(dataset_version.horizons)}."
+            )
         dataset_quality_report = dataset_reports[0] if dataset_reports else None
         pre_training_checks = [
             check_artifact_integrity(
@@ -154,40 +160,64 @@ class TrainingService:
         dataset_frame = pd.read_parquet(dataset_version.artifact_path)
         dataset_frame["date"] = pd.to_datetime(dataset_frame["date"])
         persisted_models: list[ModelVersion] = []
+        feature_columns = list(dataset_version.feature_columns)
 
+        # Gate every requested horizon before fitting anything, so a failing (or
+        # unsplittable) later horizon cannot leave earlier horizons' models behind.
+        gated: list[tuple[int, pd.DataFrame, TemporalSplit, QualityReport]] = []
         for horizon in requested_horizons:
             target_column = f"target_up_{horizon}d"
-
             training_frame = dataset_frame.dropna(subset=[target_column]).copy()
             split = self.build_split(training_frame, horizon)
-            feature_columns = list(dataset_version.feature_columns)
-            training_report = QualityReport(
-                stage=STAGE_TRAINING,
-                checks=(
-                    *pre_training_checks,
-                    *run_split_checks(
-                        dataset_frame,
-                        {
-                            "train": split.train_dates,
-                            "validation": split.validation_dates,
-                            "test": split.test_dates,
-                        },
-                        horizon=horizon,
-                        feature_columns=feature_columns,
-                        target_column=target_column,
-                        policy=self.quality_policy,
+            gated.append(
+                (
+                    horizon,
+                    training_frame,
+                    split,
+                    QualityReport(
+                        stage=STAGE_TRAINING,
+                        checks=(
+                            *pre_training_checks,
+                            *run_split_checks(
+                                dataset_frame,
+                                {
+                                    "train": split.train_dates,
+                                    "validation": split.validation_dates,
+                                    "test": split.test_dates,
+                                },
+                                horizon=horizon,
+                                feature_columns=feature_columns,
+                                target_column=target_column,
+                                policy=self.quality_policy,
+                            ),
+                        ),
                     ),
-                ),
+                )
             )
-            training_report_id = self._persist_training_report(
-                training_report,
+        report_ids = {
+            horizon: self._persist_training_report(
+                report,
                 dataset_version=dataset_version,
                 horizon=horizon,
                 requested_horizons=requested_horizons,
-                raise_on_failure=True,
+                raise_on_failure=False,
             )
+            for horizon, _, _, report in gated
+        }
+        for horizon, _, _, report in gated:
+            if not report.passed:
+                logger.warning(
+                    "Training blocked for dataset %s horizon %s by report %s",
+                    dataset_version.id,
+                    horizon,
+                    report_ids[horizon],
+                )
+                raise DataQualityGateError(report, report_ids[horizon])
+
+        for horizon, training_frame, split, training_report in gated:
+            target_column = f"target_up_{horizon}d"
             governance_json: dict[str, object] = {
-                "training_quality_report_id": training_report_id,
+                "training_quality_report_id": report_ids[horizon],
                 "training_quality_status": training_report.status,
                 "dataset_quality_report_id": (
                     dataset_quality_report.id if dataset_quality_report else None
