@@ -2,7 +2,7 @@
 
 A governed forecasting pipeline for daily US equities. Quant Almanac ingests market data, builds versioned feature datasets, trains calibrated multi-horizon classifiers, runs walk-forward backtests, generates SHAP explanations, and serves ranked signals through FastAPI.
 
-Every stage is gated and traceable. Data-quality checks block bad datasets before training, training gates block leaky splits, every artifact is content-addressed and re-verifiable, and any registered model can be refit from its artifacts to prove it reproduces. A read-only **Model Trust & Lineage Console** shows a reviewer where a model's data came from, which checks it passed, whether its artifacts are intact, and what it cannot claim.
+Every stage is gated and traceable. Data-quality checks block bad datasets before training, training gates block leaky splits, every registered artifact (dataset, model, backtest, SHAP) is content-addressed and re-verifiable, and any registered model can be refit from its artifacts to prove it reproduces. A read-only **Model Trust & Lineage Console** shows a reviewer where a model's data came from, which checks it passed, whether its artifacts are intact, and what it cannot claim.
 
 ![Model evidence page](docs/screenshots/console-model.png)
 
@@ -32,7 +32,7 @@ Quant Almanac now answers seven questions for any model, using only persisted ev
 
 ```text
  provider ──► ingestion run ──► daily_bars ──► [dataset quality gate] ──► dataset artifact (sha-addressed)
- (yfinance /    (retry, metadata)  (Postgres)     21 checks, blocks on fail      + manifest + lineage
+ (yfinance /    (retry, metadata)  (Postgres)     23 checks, blocks on fail      + manifest + lineage
   synthetic)                                           │                              │
                                                        ▼                              ▼
                                                quality_reports  ◄────────── [training gate] ──► model artifacts
@@ -69,19 +69,21 @@ Every check records its observed values, thresholds, and up to five offending ro
 | | `bars.duplicate_keys` | yes | One row per (symbol, session) across **all** providers |
 | | `bars.session_dates` | yes | Weekday sessions, nothing after the as-of date |
 | | `bars.positive_prices`, `bars.ohlc_consistency` | yes | `low ≤ open/close ≤ high` with tolerance |
-| | `bars.volume` | negative only | Zero volume warns: trading halts are legitimate |
+| | `bars.volume` | negative only | Zero volume warns: trading halts are legitimate. Undefined volume ratios after a halt become missing values, not infinities |
 | | `bars.symbol_coverage` | yes | Every requested symbol and the benchmark have bars |
+| | `bars.benchmark_calendar` | > 6.5% or long runs | The benchmark defines the calendar, so its own sessions are checked against weekdays. Up to 4.5% missing (exchange holidays) passes |
 | | `bars.calendar_alignment` | > 5% gap | Measured inside each symbol's own range, so IPOs and delistings are not penalized |
 | | `bars.trailing_coverage`, `bars.extreme_returns`, `bars.stale_prices` | no | Stale feeds, \|return\| > 40%, and frozen prices are flagged for review, not rejected |
 | Dataset | `dataset.schema`, `dataset.unique_keys`, `dataset.temporal_bounds`, `dataset.non_finite_features` | yes | Features and labels disjoint; no infinities (they break imputation) |
-| | `dataset.label_alignment` | yes | Recomputes every forward return from adjusted closes: labels are exactly t+h, none in the final h sessions |
+| | `dataset.label_alignment` | yes | Recomputes every forward return from the artifact's adjusted closes. Catches labels produced by different (e.g. off-by-one) code or edited after the build, and labels in a symbol's final h rows |
+| | `dataset.label_calendar_span` | no | Labels are h rows ahead per symbol. Warns when a symbol gap makes a label span more than h benchmark sessions |
 | | `dataset.point_in_time_features` | yes | **Look-ahead test.** Recomputes all features from history truncated at three cutoffs and requires identical values |
 | | `dataset.feature_target_leakage` | no | \|corr\| ≥ 0.98 with a same-row forward return. This is a heuristic, so it warns. The point-in-time test is the proof |
-| | `dataset.feature_missingness`, `dataset.label_availability` | partly | Post-warmup nulls; labeled rows and both classes per horizon |
+| | `dataset.feature_missingness`, `dataset.label_availability` | partly | Nulls after the 50-row warmup; labeled rows and both classes per horizon |
 | Training | `training.dataset_artifact_integrity` | yes | SHA-256 of the parquet artifact must match the manifest |
 | | `training.dataset_quality_gate` | on fail | A legacy dataset with no report trains with a recorded warning |
 | | `training.split_ordering`, `training.label_horizon_embargo` | yes | Every train/validation label must be **realized** (per symbol, t+h) before the next split starts |
-| | `training.split_class_coverage` | single class | Small splits warn |
+| | `training.split_class_coverage` | single class | Small splits warn. Every requested horizon is gated before any model is fit |
 | Backtest | walk-forward guard | aborts run | Each monthly refit's latest realized label must precede the scored month |
 | All consumers | artifact integrity | yes | Backtest, SHAP, and signal publication refuse modified artifacts |
 
@@ -93,7 +95,7 @@ No new source-of-truth tables. Lineage reuses existing records and adds one evid
 - **`model_versions.metadata_json`**: `training_config` (pipeline steps and scalar hyperparameters, split method and session counts, embargo, calibration, selection rule), `governance` (training and dataset report ids, dataset hash at training time), and `provenance`.
 - **`backtest_runs.metadata_json`**: dataset and model hashes at run time, plus walk-forward guard evidence. **SHAP summaries** record the evaluation window, sampling seed, background rows, and hashes.
 - **`quality_reports`** (migration `20261116_0002`): append-only evidence for `dataset_build`, `training`, and `reproduction`. This is the only home for evidence about **blocked** builds, which by design have no dataset row.
-- **Content-addressed artifacts**: dataset, model, and SHAP filenames embed their SHA-256 prefix, so an artifact referenced by a registry row is never overwritten.
+- **Content-addressed artifacts**: dataset, model, backtest, and SHAP filenames embed their SHA-256 prefix, so an artifact referenced by a registry row is never overwritten.
 
 Historical records are never back-filled. Anything a legacy record did not capture renders as **Unavailable**.
 
@@ -166,13 +168,14 @@ Commands executed for this change (Python 3.14.6, Linux):
 | --- | --- |
 | `ruff check src tests` | pass |
 | `mypy src` (strict) | pass, 68 source files |
-| `pytest` | 111 passed (52 pre-existing + 59 new) with Chromium available; without a browser the 2 browser tests skip with an explicit reason |
+| `pytest` | 120 passed (52 pre-existing + 68 new) with Chromium available; without a browser, 118 passed and the 2 browser tests skip with an explicit reason |
 | `pytest tests/e2e` (Playwright + Chromium) | 3 passed: index → model → expand evidence → blocked report, phone-width layout, demo summary |
 | Alembic `upgrade head → downgrade 20260316_0001 → upgrade head` | pass on SQLite (test) and PostgreSQL 16 (manual) |
 | Full governed flow on PostgreSQL 16 | pass build, blocked build, train, backtest guard, SHAP, reproduction `pass`, verification with no failures |
-| `quant-almanac-demo run` | all steps as expected; reproduction max \|Δp\| = 0 on 905 test rows |
+| `quant-almanac-demo run` (SQLite and PostgreSQL 16) | all steps as expected; reproduction max \|Δp\| = 0 on 905 test rows |
+| Independent review pass | 13 findings; every confirmed defect fixed with a regression test (see the case study) |
 
-The CI workflow now also runs the migration round-trip on PostgreSQL 17, the demo, and a separate Playwright job. Those CI steps had not executed when this README was written.
+The CI workflow now also runs the migration round-trip on PostgreSQL 17 (head → previous → base), then the full demo on that PostgreSQL database, plus a separate Playwright job. Those CI steps had not executed on GitHub when this README was written.
 
 What the demo does **not** show: predictive skill. On random-walk data the 5d champion's test ROC-AUC is 0.401 (approx. 95% CI 0.363–0.439), below chance after a regime shift. The console reports this as a high-severity limitation and marks the evaluation stage as a warning, which is the point.
 
@@ -182,6 +185,10 @@ What the demo does **not** show: predictive skill. On random-walk data the 5d ch
 - Lineage is captured from this change forward. Older registry rows show "Unavailable" and are not back-filled.
 - `daily_bars.ingestion_run_id` is last-writer-wins. A dataset records the run ids that were current at build time. Later re-ingestion is detected by the source-fingerprint check rather than preserved row by row.
 - The point-in-time test samples three cutoffs. It proves causality for those truncations, not for every date.
+- In feature set `ohlcv_v1`, `benchmark_trend` and `benchmark_high_vol` are 0 (not missing) during their 50-session warmup. This is a pre-existing feature quirk, surfaced as a limitation rather than silently changed, because changing it would alter `ohlcv_v1` values.
+- Each walk-forward refit leaves its newest ~20% of history unused (the split's test partition plus embargoes). This is safe from leakage but stale: in the demo, the newest label behind a scored month is at least 91 sessions old.
+- `train` commits each horizon separately. Gates for every horizon run before any fit, but an unexpected fitting error on a later horizon can still leave earlier horizons persisted.
+- The API returns local artifact paths. The console loads model bundles (joblib) only after their hash matches the registry.
 - AUC intervals use Hanley–McNeil, which assumes independent observations. Overlapping multi-day labels make the true interval wider, and the console says so.
 - Reproduction is exact within one runtime. Library upgrades are flagged by version comparison and may change predictions within numerical tolerance.
 - Universe selection is fixed at build time, so survivorship bias is possible. Champion selection uses a single embargoed holdout. Backtests are simplified long-only equal-weight simulations.

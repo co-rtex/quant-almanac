@@ -23,7 +23,7 @@ The dataset build reads persisted bars and is where they become model inputs, so
 
 Severity follows from the domain:
 
-- **Fail** for anything that corrupts features or labels: duplicate keys across providers, OHLC violations, non-positive prices, weekend or future timestamps, more than 5% of benchmark sessions missing inside a symbol's own trading range, infinite features, misaligned labels, and look-ahead features.
+- **Fail** for anything that corrupts features or labels: duplicate keys across providers, OHLC violations, non-positive prices, weekend or future timestamps, more than 5% of benchmark sessions missing inside a symbol's own trading range, a benchmark calendar with more gaps than holidays explain, infinite features, labels that differ from a recomputation, and look-ahead features.
 - **Warn** for conditions that are legitimate in equity data but worth a reviewer's attention: zero-volume halts, moves above 40%, frozen prices, and a symbol whose history ends early. Calendar gaps are measured only between a symbol's first and last bar, so IPOs and delistings are not rejected.
 
 All thresholds live in a versioned `DataQualityPolicy`, and each report stores the policy that produced it. A later policy change therefore never reinterprets old evidence.
@@ -31,9 +31,9 @@ All thresholds live in a versioned `DataQualityPolicy`, and each report stores t
 ### 2. Test for leakage instead of asserting it
 
 - **Point-in-time recomputation.** For three date cutoffs, features are rebuilt from bars truncated at the cutoff, and every feature cell on or before it must match the full-history value to within 1e-9. A unit test shows the check catching a deliberately leaky `shift(-1)` feature and naming the feature, date, and both values.
-- **Label alignment.** Every `forward_return_{h}d` is recomputed from adjusted closes. Any off-by-one horizon, label in the final h sessions, or target/return disagreement fails the build.
+- **Label alignment.** Every `forward_return_{h}d` is recomputed from the artifact's adjusted closes. Labels produced by different code (e.g. off by one), edited after the build, present in a symbol's final h rows, or disagreeing with their target fail the build. A separate check warns when a symbol gap makes an "h-day" label span more than h benchmark sessions. Recomputation alone cannot detect that, because it repeats the same per-symbol shift.
 - **Realized-date embargo.** For each training row, the session on which its label becomes known is the symbol's own session h rows later. The training gate requires that every train label is realized before validation starts and every validation label before test starts. This is the exact leakage condition, and it stays correct when symbols have gaps.
-- **Walk-forward guard.** Every monthly refit in a backtest checks that its latest realized label precedes the first scored session, or the backtest aborts. The demo's 5d backtest recorded at least 91 sessions of slack across 21 refits.
+- **Walk-forward guard.** Every monthly refit in a backtest checks that its latest realized label precedes the first scored session, or the backtest aborts. The guard also exposed a pre-existing design cost: each refit leaves its newest ~20% of history unused (the split's test partition plus embargoes). In the demo, the newest label behind a scored month was at least 91 sessions old across 21 refits. This is reported as a staleness limitation, not as a safety margin.
 
 The correlation screen (|corr| ≥ 0.98 between a feature and a same-row forward return) produced a false positive on an existing deterministic test fixture whose prices are genuinely predictable. It was downgraded to a warning, and the recomputation test remains the proof.
 
@@ -47,7 +47,7 @@ Lineage pointers go into the existing `metadata_json` columns, following the rep
 
 Only one table was added. `quality_reports` exists because a blocked build has no dataset row to attach evidence to. Reports are append-only.
 
-Artifacts are now **content-addressed**: they are written to a temporary file, hashed, and then atomically renamed to a path containing the hash prefix. This fixes the overwrite defect at its source.
+Dataset, model, backtest, and SHAP artifacts are now **content-addressed**: they are written to a temporary file, hashed, and then atomically renamed to a path containing the hash prefix. This fixes the overwrite defect at its source.
 
 Historical rows are never back-filled. For example, `daily_bars.ingestion_run_id` is last-writer-wins, so it is not trusted retroactively. Missing evidence renders as "Unavailable".
 
@@ -80,7 +80,7 @@ Limitations are **derived** from evidence: synthetic data, an AUC interval at or
 | Step | Outcome |
 | --- | --- |
 | Ingest 5 synthetic tickers + `BADQ` (2021-01-04 → 2024-06-28) | 6,283 bars |
-| Build clean dataset | 4,550 rows; 21 checks pass |
+| Build clean dataset | 4,550 rows; 23 checks pass |
 | Build with `BADQ` | **Blocked**: `bars.positive_prices`, `bars.ohlc_consistency`, `bars.calendar_alignment` (exactly the three injected defects); no artifact written |
 | Train 1d/5d/20d | 6 models, 3 training-gate reports pass |
 | Backtest + SHAP (5d champion) | Walk-forward guard pass; content-addressed artifacts |
@@ -89,10 +89,26 @@ Limitations are **derived** from evidence: synthetic data, an AUC interval at or
 
 The demo is honest about results. On a random walk, the validation-selected 5d champion scores a test ROC-AUC of 0.401 (approx. 95% CI 0.363–0.439). The console flags this as below chance and marks the evaluation stage as a warning instead of a pass.
 
+## Independent review
+
+After implementation, a separate reviewer audited the change without seeing my conclusions. It reported 13 findings. The substantiated ones were all fixed, each with a regression test:
+
+- **A single zero-volume session blocked the whole build.** `bars.volume` warned as designed, but `pct_change` of volume produced `inf`, which `dataset.non_finite_features` then failed. Undefined volume ratios now become missing values, which the model pipelines impute. Those rows could never have been trained on before, so no trainable dataset changes.
+- **Lineage stepper statuses ignored live checks.** A tampered dataset artifact still showed a green Dataset hop. Every hop now combines its build-time verdict with the live checks that cover it.
+- **`label_alignment` overstated its guarantee across symbol gaps.** Its claim was narrowed, and `dataset.label_calendar_span` was added.
+- **The benchmark's own calendar was never validated.** `bars.benchmark_calendar` now checks it.
+- **The feature warmup was set to 21 rows, but the longest lookback is 50.** Fixed, and the `ohlcv_v1` placeholder quirk is surfaced as a limitation.
+- **The git dirty flag ignored untracked modules and was cached per process.** Fixed, and git is trusted only when the package sits in the reported work tree.
+- **The console returned 500 on partially recorded models.** The templates are now defensive.
+- **Backtest artifacts were not content-addressed.** They now are.
+- **A gate failure on a later horizon could leave earlier horizons' models persisted.** All gates now run first.
+- **The blocked-build count covered only the latest 50 reports.** It is now a real count.
+- **The CI demo ran only on SQLite.** It now runs on PostgreSQL.
+
 ## Testing
 
 - **Unit:** every bar, dataset, and training check on valid inputs and on a targeted defect, including a leaky feature caught by point-in-time recomputation, an off-by-one label, a too-short embargo, and per-symbol label realization with gaps. Also covered: AUC interval math, artifact integrity states, synthetic provider determinism and defects, and chart geometry.
-- **Integration (SQLite):** a passing build links its report and lineage; a rebuild never overwrites an older artifact; a defective build is blocked and leaves evidence; training refuses a tampered artifact or a failed dataset report; a legacy dataset trains with a recorded warning and renders as unavailable; verification passes and then detects source drift, model tampering, and a bundle/registry mismatch; reproduction passes and detects changed hyperparameters; the backtest guard and SHAP non-overwrite hold.
+- **Integration (SQLite):** a zero-volume halt warns without blocking; stepper statuses turn warn or fail after source drift or artifact tampering; all horizons are gated before any fit; backtest artifacts are content-addressed; a passing build links its report and lineage; a rebuild never overwrites an older artifact; a defective build is blocked and leaves evidence; training refuses a tampered artifact or a failed dataset report; a legacy dataset trains with a recorded warning and renders as unavailable; verification passes and then detects source drift, model tampering, and a bundle/registry mismatch; reproduction passes and detects changed hyperparameters; the backtest guard and SHAP non-overwrite hold.
 - **API, console, CLI:** 200 and 404 paths, 422 validation, CSP headers, HTML escaping of persisted text, and non-zero exit codes on failing verdicts.
 - **Migrations:** upgrade, downgrade, and upgrade in tests (SQLite) and by hand on PostgreSQL 16, plus the full governed flow on PostgreSQL.
 - **Browser (Playwright/Chromium):** index → model → expand collapsed evidence → blocked report, with no console errors and no horizontal scroll at 390 px.

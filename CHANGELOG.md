@@ -4,7 +4,7 @@
 
 ### Added — Data Quality, Governance & Lineage
 
-- `quant_signal.quality`: versioned `DataQualityPolicy` (`dq_v1`) and 21 dataset-build checks (source bars + dataset), including point-in-time feature recomputation and forward-return label alignment
+- `quant_signal.quality`: versioned `DataQualityPolicy` (`dq_v1`) and 23 dataset-build checks (13 source-bar, 10 dataset), including point-in-time feature recomputation and forward-return label alignment
 - Blocking dataset quality gate; blocked builds persist evidence and write no artifact or manifest
 - Training gate: dataset artifact integrity, dataset verdict, split ordering, realized-date label-horizon embargo, class coverage
 - `quality_reports` table (migration `20261116_0002`) for `dataset_build`, `training`, and `reproduction` evidence
@@ -18,7 +18,9 @@
 
 ### Fixed
 
-- Dataset, model, and SHAP artifacts were overwritten on rebuild/retrain/re-run, invalidating hashes recorded by earlier registry rows; artifacts are now content-addressed
+- Dataset, model, backtest, and SHAP artifacts could be overwritten on rebuild/retrain/re-run, invalidating hashes recorded by earlier registry rows; they are now content-addressed
+- Zero-volume sessions produced infinite volume features; undefined ratios are now missing values
+- `train` with a horizon the dataset lacks raised a raw `KeyError`; it now raises a clear `ValueError` before any work
 - `GET /v1/models/{id}` returned 500 for unknown ids; it now returns 404
 - Migration tests honored the CI `DATABASE_URL` and inspected an empty SQLite file, which had failed every CI run; they now pin their own database
 - NaN hyperparameters are stored as strings so model metadata is valid JSON on PostgreSQL

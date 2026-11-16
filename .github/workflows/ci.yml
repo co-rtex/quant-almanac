@@ -43,9 +43,9 @@ jobs:
         run: |
           alembic upgrade head
           alembic downgrade 20260316_0001
-          alembic upgrade head
-      - name: Governance demo (synthetic data, end to end)
-        run: quant-almanac-demo run --workdir "$RUNNER_TEMP/quant-almanac-demo"
+          alembic downgrade base
+      - name: Governance demo on PostgreSQL (synthetic data, end to end)
+        run: quant-almanac-demo run --workdir "$RUNNER_TEMP/quant-almanac-demo" --database-url "$DATABASE_URL"
 
   e2e:
     runs-on: ubuntu-latest
