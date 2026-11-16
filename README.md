@@ -1,4 +1,4 @@
-# Quant Signal Workstation & Forecasting Pipeline
+# Quant Almanac
 
 Production-minded forecasting platform for daily US equities. The system ingests market data, builds reproducible feature datasets, trains calibrated multi-horizon models, runs regime-aware backtests, generates SHAP explainability artifacts, and serves ranked signals through FastAPI.
 
