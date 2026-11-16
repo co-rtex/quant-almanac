@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, check_list %}
+{% block title %}Quality report {{ report.quality_report_id[:8] }} · Quant Almanac{% endblock %}
+{% block content %}
+{% set req = report.request %}
+<div class="page-head">
+  <div>
+    <p class="eyebrow"><a href="/console">Quality reports</a> / {{ report.quality_report_id|short }}</p>
+    <h1>{{ report.stage|replace('_', ' ')|capitalize }} report</h1>
+    <div class="meta-row">
+      <span>policy <code>{{ report.policy_version }}</code></span>
+      <span>recorded {{ (report.created_at or '')[:19]|replace('T', ' ') }}</span>
+      <span>report <span class="hash">{{ report.quality_report_id }}</span></span>
+    </div>
+  </div>
+  <div data-testid="report-verdict">{{ chip(report.status, large=true) }}</div>
+</div>
+
+{% if report.stage == 'dataset_build' and report.status == 'fail' %}
+<div class="card" data-testid="blocked-notice">
+  <h2>Build blocked by the quality gate</h2>
+  <p class="lede">No dataset artifact or manifest was written for this request, so nothing downstream can train on it. This report is the durable record of why.</p>
+</div>
+{% endif %}
+
+<div class="grid-2">
+  <section class="card" aria-labelledby="request-heading">
+    <h2 id="request-heading">Request</h2>
+    <dl class="kv">
+      {% for key, value in req|dictsort %}
+      <dt>{{ key|replace('_', ' ') }}</dt><dd>{% if value is iterable and value is not string %}{{ value|join(', ') }}{% else %}{{ value if value is not none else '—' }}{% endif %}</dd>
+      {% endfor %}
+      {% if report.dataset_version_id %}<dt>dataset version</dt><dd class="hash">{{ report.dataset_version_id }}</dd>{% endif %}
+      {% if report.model_version_id %}<dt>model version</dt><dd><a class="hash" href="/console/models/{{ report.model_version_id }}">{{ report.model_version_id }}</a></dd>{% endif %}
+    </dl>
+  </section>
+  <section class="card" aria-labelledby="verdict-heading">
+    <h2 id="verdict-heading">Verdict</h2>
+    <p>{{ report.summary }}</p>
+    <p class="muted">{{ report.check_count }} checks · {{ report.failure_count }} failed · {{ report.warning_count }} warnings. Failures block downstream use; warnings are recorded and surfaced as model limitations.</p>
+    {% for note in (report.context or {}).get('notes', []) %}<p class="disclaimer">{{ note }}</p>{% endfor %}
+  </section>
+</div>
+
+{% if source_bars %}
+<section class="card" aria-labelledby="sources-heading">
+  <h2 id="sources-heading">Source bars read by this build</h2>
+  <p class="section-note">{{ source_bars.row_count|num }} bars · {{ source_bars.first_date }} → {{ source_bars.last_date }} · fingerprint <span class="hash">{{ source_bars.fingerprint_sha256 }}</span></p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Symbol</th><th>Source</th><th>Ingestion run</th><th class="num">Bars</th><th>First</th><th>Last</th></tr></thead>
+    <tbody>
+    {% for row in source_bars.by_symbol %}
+    <tr><td>{{ row.symbol }}</td><td>{{ row.source }}</td><td class="hash">{{ row.ingestion_run_id|short }}</td><td class="num">{{ row.rows|num }}</td><td>{{ row.first_date }}</td><td>{{ row.last_date }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+
+{% for category, checks in categories.items() %}
+<section class="card" aria-label="{{ category }} checks">
+  <div class="card-head"><h2>{{ category|capitalize }}</h2></div>
+  {{ check_list(checks, collapse_passing=false) }}
+</section>
+{% endfor %}
+{% endblock %}

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "quant-signal-workstation"
 version = "0.1.0"
-description = "Production-minded quant signal workstation and forecasting pipeline."
+description = "Quant Almanac: a governed equity forecasting pipeline with data-quality gates, experiment lineage, and reproducibility checks."
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "alembic>=1.16,<2",
   "fastapi>=0.135,<1",
+  "jinja2>=3.1,<4",
   "joblib>=1.5,<2",
   "numpy>=2.3,<3",
   "pandas>=2.3,<3",
@@ -35,10 +36,14 @@ dev = [
   "pytest>=8.4,<9",
   "ruff>=0.14,<1",
 ]
+e2e = [
+  "playwright>=1.48,<2",
+]
 
 [project.scripts]
 quant-signal-api = "quant_signal.api.app:run"
 quant-signal-pipeline = "quant_signal.cli.pipeline:run"
+quant-almanac-demo = "quant_signal.demo:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/quant_signal"]
@@ -46,6 +51,9 @@ packages = ["src/quant_signal"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "e2e: browser tests that need the optional `e2e` extra and a Chromium binary",
+]
 
 [tool.ruff]
 target-version = "py314"

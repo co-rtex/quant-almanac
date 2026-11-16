@@ -17,7 +17,9 @@ from quant_signal.core.config import Settings
 from quant_signal.core.logging import configure_logging
 from quant_signal.explainability.service import ExplainabilityService
 from quant_signal.features.pipeline import FeaturePipeline
+from quant_signal.governance import GovernanceService
 from quant_signal.ingestion.service import IngestionService
+from quant_signal.quality import ArtifactIntegrityError, DataQualityGateError
 from quant_signal.storage.models import (
     BacktestRun,
     DatasetVersion,
@@ -34,6 +36,7 @@ FeaturePipelineFactory = Callable[[Settings], FeaturePipeline]
 TrainingServiceFactory = Callable[[Settings], TrainingService]
 BacktestServiceFactory = Callable[[Settings], BacktestService]
 ExplainabilityServiceFactory = Callable[[Settings], ExplainabilityService]
+GovernanceServiceFactory = Callable[[Settings], GovernanceService]
 
 
 def _parse_date(value: str) -> date:
@@ -89,6 +92,12 @@ def _build_explainability_service(settings: Settings) -> ExplainabilityService:
     return ExplainabilityService(settings=settings)
 
 
+def _build_governance_service(settings: Settings) -> GovernanceService:
+    """Build the governance service for CLI execution."""
+
+    return GovernanceService(settings=settings)
+
+
 @dataclass(frozen=True)
 class ServiceFactories:
     """Factory bundle used by command handlers."""
@@ -98,6 +107,7 @@ class ServiceFactories:
     training: TrainingServiceFactory = _build_training_service
     backtesting: BacktestServiceFactory = _build_backtest_service
     explainability: ExplainabilityServiceFactory = _build_explainability_service
+    governance: GovernanceServiceFactory = _build_governance_service
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -228,6 +238,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish_signals_parser.set_defaults(handler=_handle_publish_signals)
 
+    verify_parser = subparsers.add_parser(
+        "verify-model",
+        help="Re-verify artifacts, lineage, and quality gates for one model (read-only).",
+    )
+    verify_parser.add_argument(
+        "--model-version-id",
+        required=True,
+        help="Persisted model version identifier to verify.",
+    )
+    verify_parser.set_defaults(handler=_handle_verify_model)
+
+    reproduce_parser = subparsers.add_parser(
+        "reproduce-model",
+        help="Refit one model from its dataset artifact and compare predictions and metrics.",
+    )
+    reproduce_parser.add_argument(
+        "--model-version-id",
+        required=True,
+        help="Persisted model version identifier to reproduce.",
+    )
+    reproduce_parser.set_defaults(handler=_handle_reproduce_model)
+
+    quality_parser = subparsers.add_parser(
+        "quality-reports",
+        help="List persisted data-quality and governance reports, or show one report.",
+    )
+    quality_parser.add_argument("--report-id", help="Show one report with every check.")
+    quality_parser.add_argument(
+        "--stage",
+        choices=["dataset_build", "training", "reproduction"],
+        help="Filter by pipeline stage.",
+    )
+    quality_parser.add_argument(
+        "--status",
+        choices=["pass", "warn", "fail"],
+        help="Filter by aggregate status.",
+    )
+    quality_parser.add_argument("--limit", type=int, default=20, help="Maximum rows to list.")
+    quality_parser.set_defaults(handler=_handle_quality_reports)
+
     return parser
 
 
@@ -336,6 +386,81 @@ def _handle_publish_signals(
     return _summarize_signal_snapshot_refresh(refresh_result)
 
 
+def _handle_verify_model(
+    args: argparse.Namespace,
+    settings: Settings,
+    service_factories: ServiceFactories,
+) -> dict[str, object]:
+    """Execute live verification; a failing verdict yields a non-zero exit code."""
+
+    report = service_factories.governance(settings).verify_model(args.model_version_id)
+    return {
+        "command": "verify-model",
+        "model_version_id": args.model_version_id,
+        **report.summary_json(),
+        "checks": [
+            {"check_id": check.check_id, "status": check.status, "message": check.message}
+            for check in report.checks
+        ],
+    }
+
+
+def _handle_reproduce_model(
+    args: argparse.Namespace,
+    settings: Settings,
+    service_factories: ServiceFactories,
+) -> dict[str, object]:
+    """Execute a reproduction run; a failing verdict yields a non-zero exit code."""
+
+    report, report_id = service_factories.governance(settings).reproduce_model(
+        args.model_version_id
+    )
+    return {
+        "command": "reproduce-model",
+        "model_version_id": args.model_version_id,
+        "quality_report_id": report_id,
+        **report.summary_json(),
+        "checks": [
+            {"check_id": check.check_id, "status": check.status, "message": check.message}
+            for check in report.checks
+        ],
+    }
+
+
+def _handle_quality_reports(
+    args: argparse.Namespace,
+    settings: Settings,
+    service_factories: ServiceFactories,
+) -> dict[str, object]:
+    """List quality reports or show one report in full."""
+
+    service = service_factories.governance(settings)
+    if args.report_id:
+        report = service.get_quality_report(args.report_id)
+        return {"command": "quality-reports", "status": "completed", "report": report}
+    reports = service.list_quality_reports(stage=args.stage, status=args.status, limit=args.limit)
+    return {
+        "command": "quality-reports",
+        "status": "completed",
+        "reports": [
+            {
+                key: report[key]
+                for key in (
+                    "quality_report_id",
+                    "stage",
+                    "status",
+                    "summary",
+                    "dataset_version_id",
+                    "model_version_id",
+                    "horizon_days",
+                    "created_at",
+                )
+            }
+            for report in reports
+        ],
+    }
+
+
 def _summarize_ingestion_run(run: IngestionRun) -> dict[str, object]:
     """Build a stable JSON summary for ingestion command output."""
 
@@ -376,6 +501,7 @@ def _summarize_dataset_version(dataset: DatasetVersion) -> dict[str, object]:
         "artifact_hash": dataset.artifact_hash,
         "benchmark_symbol": metadata.get("benchmark_symbol"),
         "date_range": date_range,
+        "quality": _metadata_section(metadata, "quality"),
     }
 
 
@@ -423,6 +549,9 @@ def _model_version_summary(model: ModelVersion) -> dict[str, object]:
         "status": model.status,
         "artifact_path": model.artifact_path,
         "artifact_hash": model.artifact_hash,
+        "training_quality_report_id": _metadata_section(model.metadata_json, "governance").get(
+            "training_quality_report_id"
+        ),
     }
 
 
@@ -581,23 +710,31 @@ def main(
         handler = args.handler
         payload = handler(args, resolved_settings, factories)
     except Exception as exc:
-        logger.exception("Pipeline command %s failed", args.command)
-        json.dump(
-            {
-                "command": args.command,
-                "status": "failed",
-                "error_type": exc.__class__.__name__,
-                "error": str(exc),
-            },
-            error_output,
-            sort_keys=True,
-        )
+        if isinstance(exc, (DataQualityGateError, ArtifactIntegrityError)):
+            # Expected, evidence-backed rejections: the JSON payload carries the details.
+            logger.error("Pipeline command %s rejected: %s", args.command, exc)
+        else:
+            logger.exception("Pipeline command %s failed", args.command)
+        error_payload: dict[str, object] = {
+            "command": args.command,
+            "status": "failed",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        }
+        if isinstance(exc, DataQualityGateError):
+            error_payload["quality_report_id"] = exc.quality_report_id
+            error_payload["quality"] = exc.report.summary_json()
+        if isinstance(exc, ArtifactIntegrityError):
+            error_payload["integrity_check"] = exc.result.to_json()
+        json.dump(error_payload, error_output, sort_keys=True)
         error_output.write("\n")
         return 1
 
     json.dump(payload, output, sort_keys=True)
     output.write("\n")
-    return 0
+    # Governance commands report a verdict rather than raising; a failed verdict must
+    # still fail the process so schedulers and CI can gate on it.
+    return 1 if payload.get("status") == "fail" else 0
 
 
 def run() -> None:

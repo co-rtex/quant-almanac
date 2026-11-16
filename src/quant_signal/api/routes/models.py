@@ -1,6 +1,6 @@
 """Model metadata endpoints."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from quant_signal.api.deps import get_signal_service
 from quant_signal.api.schemas import (
@@ -20,7 +20,10 @@ def get_model_metadata(
 ) -> ModelMetadataResponse:
     """Return persisted model metadata."""
 
-    model = service.get_model_version(model_version)
+    try:
+        model = service.get_model_version(model_version)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return ModelMetadataResponse(
         model_version_id=model.id,
         dataset_version_id=model.dataset_version_id,

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Quant Almanac Console{% endblock %}</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="{{ url_for('console-static', path='console.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="/console">
+        <span class="brand-name">Quant Almanac</span>
+        <span class="brand-sub">Model Trust &amp; Lineage Console</span>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="/console" {% if active == 'index' %}aria-current="page"{% endif %}>Models &amp; evidence</a>
+        <a href="/docs">API</a>
+      </nav>
+    </div>
+  </header>
+  {% if synthetic %}
+  <div class="banner" role="note" data-testid="synthetic-banner">
+    <div class="wrap"><strong>SYNTHETIC DATA</strong> — records on this page were produced from a seeded random-walk fixture. They demonstrate the pipeline and its controls; they are not market data or investment performance.</div>
+  </div>
+  {% endif %}
+  <main>
+    <div class="wrap">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap">
+      <p>Read-only research console. Every value is read from persisted registry records and artifacts; anything not recorded is shown as unavailable rather than estimated.</p>
+      <p>Not investment advice. Backtests are simulations under stated assumptions.</p>
+    </div>
+  </footer>
+</body>
+</html>

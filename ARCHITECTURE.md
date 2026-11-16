@@ -20,12 +20,17 @@
 - `quant_signal.backtesting`: walk-forward simulation and regime analysis
 - `quant_signal.explainability`: SHAP generation tied to model versions
 - `quant_signal.serving`: ranked signal retrieval and model metadata read services
+- `quant_signal.quality`: versioned data-quality policy, typed check results, bar/dataset/training gates, artifact integrity
+- `quant_signal.governance`: lineage assembly, live verification, refit-based reproduction, evidence-derived limitations
+- `quant_signal.console`: server-rendered, read-only Model Trust & Lineage Console (Jinja2 templates, CSS, view helpers)
 
 ## Persistence Model
 
 - PostgreSQL stores normalized raw bars, ingestion runs, dataset manifests, model registry records, evaluations, backtests, explainability run metadata, and signal snapshots.
 - Versioned Parquet artifacts under `artifacts/` store model-ready feature datasets and serialized model bundles.
 - Hashes and metadata in PostgreSQL point to the exact artifact path used by downstream stages.
+- Dataset, model, backtest, and SHAP artifacts are content-addressed (the SHA-256 prefix is part of the filename), so a rebuild or retrain never overwrites an artifact that an older registry row references.
+- `quality_reports` is an append-only evidence table for `dataset_build`, `training`, and `reproduction` gates. It is the only durable record of builds the gate blocked.
 - The v1 schema uses logically grouped tables in the default database schema to keep local testing portable; service boundaries do not depend on physical schema names, so a later Postgres schema split remains reversible.
 
 ## Data Flow
@@ -65,3 +70,31 @@
 - Keep provider selection config-driven so scheduled entrypoints can become thin orchestration later.
 - Store wide feature matrices in Parquet artifacts rather than a mutable wide SQL table.
 - Keep backtesting assumptions explicit and simple: monthly retraining, equal-weight long-only sleeves, benchmark-derived regime labels, configurable per-side transaction cost/slippage assumptions, benchmark-relative analytics, and companion detail artifacts for turnover-aware, attribution-ready, and regime-aware reporting.
+
+## Data Quality, Governance & Lineage (Phase 16)
+
+### Decisions
+
+- **Gate at consumption, not ingestion.** Raw bars are persisted as fetched; the dataset build is where bars become model inputs, so it runs the blocking checks. A failed build writes no artifact and no manifest, only a `quality_reports` row with the refused request, so nothing downstream can train on it.
+- **One new table, no new sources of truth.** Lineage pointers live in the existing `metadata_json` columns (the repository's schema-light convention). `quality_reports` exists because blocked builds have no other home. Reports are immutable; the dataset manifest stores only a pointer plus the verdict.
+- **Fail vs. warn is explicit and policy-versioned.** Checks that protect training or evaluation correctness fail (duplicate keys, OHLC violations, non-positive prices, calendar gaps above 5%, a benchmark calendar with more gaps than holidays, labels that differ from recomputation, look-ahead features, embargo violations, artifact tampering). Legitimate-but-notable market conditions warn (zero-volume halts, extreme moves, stale runs, IPO/delisting ranges are excluded from gap math). `DataQualityPolicy` is serialized into every report.
+- **Prove look-ahead safety by recomputation.** `dataset.point_in_time_features` rebuilds every feature from history truncated at several cutoffs and requires identical values. The correlation screen is kept only as a warning because deterministic series can be legitimately predictable.
+- **Embargo checks use realized label dates.** A row's label is realized on its symbol's own session h rows later, so the check is exact even with symbol-specific gaps, rather than inferring safety from the embargo length.
+- **Gate all horizons before fitting.** `train` evaluates and persists every requested horizon's gate report before fitting any model, so a failing horizon cannot leave a partial model set behind.
+- **Lineage stages combine verdicts.** Each console hop takes the worst of its build-time report and the live checks covering it.
+- **Verification is live and read-only; reproduction is explicit and persisted.** Verification (hashing, bundle comparison, fingerprinting) is cheap enough to compute on each console view and never writes. Reproduction refits a model and is persisted as evidence.
+- **Never invent history.** Legacy rows without lineage render as "Unavailable"; no back-filling from current state (e.g. `daily_bars.ingestion_run_id` is last-writer-wins, so it is not trusted retroactively).
+- **Server-rendered console.** FastAPI + Jinja2 with no JavaScript keeps the stack single-language, testable with `TestClient`, and compatible with a strict CSP. Chart geometry is computed in Python view helpers.
+
+### Contract Points
+
+- `FeaturePipeline.build_dataset(...)` raises `DataQualityGateError(report, quality_report_id)` when a blocking check fails.
+- `TrainingService.train(...)` raises `DataQualityGateError` on a tampered dataset artifact, a failed dataset report, or a failed split/embargo check; each horizon persists a `training` report referenced from `metadata_json.governance`.
+- `BacktestService`, `ExplainabilityService`, and `TrainingService.refresh_signal_snapshots` raise `ArtifactIntegrityError` on modified artifacts.
+- `GovernanceService.model_lineage / verify_model / reproduce_model / model_evidence` back the CLI (`verify-model`, `reproduce-model`, `quality-reports`), `/v1/governance/*`, and `/console`.
+
+### Tradeoffs
+
+- Content-addressed artifacts use more disk on repeated builds; correctness of historical manifests is worth it.
+- Live verification re-hashes artifacts per page view; fine at research scale, and would move behind a cache or background job at larger scale.
+- The console has no authentication and binds to loopback in the demo; a shared deployment needs auth in front of it.
