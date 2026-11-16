@@ -4,7 +4,18 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from quant_signal.core.time import utc_now
@@ -95,6 +106,9 @@ class DatasetVersion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
 
     model_versions: Mapped[list[ModelVersion]] = relationship(back_populates="dataset_version")
+    quality_reports: Mapped[list[QualityReportRecord]] = relationship(
+        back_populates="dataset_version"
+    )
 
 
 class ModelVersion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -224,3 +238,44 @@ class SignalSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
 
     model_version: Mapped[ModelVersion] = relationship(back_populates="signal_snapshots")
+
+
+class QualityReportRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Append-only evidence from a data-quality or governance gate.
+
+    Rows are written for passing *and* blocked runs. A blocked dataset build has no
+    ``dataset_versions`` row, so this table is the only durable record of why the
+    build was rejected; ``request_json`` captures the exact request that was refused.
+    """
+
+    __tablename__ = "quality_reports"
+
+    stage: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    dataset_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("dataset_versions.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    model_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_versions.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    horizon_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    check_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    warning_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    checks_json: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON,
+        default=list,
+        nullable=False,
+    )
+    request_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+    context_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
+
+    dataset_version: Mapped[DatasetVersion | None] = relationship(
+        back_populates="quality_reports"
+    )

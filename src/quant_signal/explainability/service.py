@@ -11,7 +11,9 @@ import pandas as pd
 import shap
 
 from quant_signal.core.config import Settings, get_settings
-from quant_signal.core.hashing import sha256_file
+from quant_signal.core.hashing import sha256_bytes
+from quant_signal.core.provenance import provenance_snapshot
+from quant_signal.quality import require_artifact_integrity
 from quant_signal.storage.db import session_scope
 from quant_signal.storage.models import ShapRun
 from quant_signal.storage.repositories import ShapRunRecord, StorageRepository
@@ -41,6 +43,16 @@ class ExplainabilityService:
             model_version = repository.get_model_version(model_version_id)
             dataset_version = repository.get_dataset_version(model_version.dataset_version_id)
 
+        require_artifact_integrity(
+            model_version.artifact_path,
+            model_version.artifact_hash,
+            "model",
+        )
+        require_artifact_integrity(
+            dataset_version.artifact_path,
+            dataset_version.artifact_hash,
+            "dataset",
+        )
         bundle = joblib.load(model_version.artifact_path)
         dataset_frame = pd.read_parquet(dataset_version.artifact_path)
         dataset_frame["date"] = pd.to_datetime(dataset_frame["date"])
@@ -109,18 +121,40 @@ class ExplainabilityService:
             "global_importance": global_importance,
             "local_explanations": local_explanations,
             "sample_size": int(len(sample)),
+            "methodology": {
+                "explainer": type(explainer).__name__,
+                "explained_output": "calibrated positive-class probability",
+                "evaluation_window": {
+                    "split": "test",
+                    "start_date": str(model_version.test_start_date),
+                    "end_date": str(model_version.test_end_date),
+                    "observations": int(len(evaluation_frame)),
+                },
+                "sample_random_state": 42,
+                "background_rows": int(len(background)),
+                "background_selection": "first rows of the test window",
+                "requested_sample_size": int(sample_size),
+                "top_signals": int(top_signals),
+            },
+            "lineage": {
+                "model_artifact_sha256": model_version.artifact_hash,
+                "dataset_version_id": dataset_version.id,
+                "dataset_artifact_sha256": dataset_version.artifact_hash,
+            },
+            "provenance": provenance_snapshot(),
         }
 
+        payload = json.dumps(summary_json, indent=2, default=str).encode("utf-8")
+        artifact_hash = sha256_bytes(payload)
+        # Content-addressed: re-running SHAP never overwrites an artifact that an
+        # earlier ``shap_runs`` row references.
         artifact_path = (
             Path(self.settings.artifact_root)
             / "explainability"
-            / f"shap_{model_version_id}.json"
+            / f"shap_{model_version_id}_{artifact_hash[:12]}.json"
         )
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_text(
-            json.dumps(summary_json, indent=2, default=str),
-            encoding="utf-8",
-        )
+        artifact_path.write_bytes(payload)
 
         with session_scope(self.database_url) as session:
             repository = StorageRepository(session)
@@ -129,7 +163,7 @@ class ExplainabilityService:
                     model_version_id=model_version_id,
                     sample_size=int(len(sample)),
                     artifact_path=str(artifact_path),
-                    artifact_hash=sha256_file(artifact_path),
+                    artifact_hash=artifact_hash,
                     summary_json=summary_json,
                 )
             )

@@ -107,4 +107,8 @@ def build_market_data_provider(settings: Settings) -> MarketDataProvider:
     provider_name = settings.market_data_provider
     if provider_name == YFinanceMarketDataProvider.name:
         return YFinanceMarketDataProvider()
+    if provider_name == "synthetic":
+        from quant_signal.ingestion.synthetic import SyntheticMarketDataProvider
+
+        return SyntheticMarketDataProvider()
     raise ValueError(f"Unsupported market data provider: {provider_name}")

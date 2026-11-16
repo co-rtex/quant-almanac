@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import joblib
 import pandas as pd
@@ -18,12 +22,27 @@ from sklearn.preprocessing import StandardScaler
 
 from quant_signal.core.config import Settings, get_settings
 from quant_signal.core.hashing import sha256_file, sha256_json
+from quant_signal.core.provenance import provenance_snapshot
 from quant_signal.evaluation.metrics import compute_classification_metrics
 from quant_signal.evaluation.reporting import rank_candidate_metrics
 from quant_signal.features.splits import TemporalSplit, build_temporal_split
+from quant_signal.quality import (
+    STAGE_DATASET_BUILD,
+    STAGE_TRAINING,
+    CheckResult,
+    CheckStatus,
+    DataQualityGateError,
+    DataQualityPolicy,
+    QualityReport,
+    check_artifact_integrity,
+    require_artifact_integrity,
+    worst_status,
+)
+from quant_signal.quality.persistence import persist_quality_report
+from quant_signal.quality.training import run_split_checks
 from quant_signal.serving.service import rank_signal_frame
 from quant_signal.storage.db import session_scope
-from quant_signal.storage.models import ModelVersion
+from quant_signal.storage.models import DatasetVersion, ModelVersion, QualityReportRecord
 from quant_signal.storage.repositories import (
     EvaluationRecord,
     ModelArtifactRecord,
@@ -31,6 +50,29 @@ from quant_signal.storage.repositories import (
     StorageRepository,
 )
 from quant_signal.training.artifacts import ModelArtifactBundle, ProbabilityCalibrator
+
+logger = logging.getLogger(__name__)
+
+SPLIT_VALIDATION_FRACTION = 0.2
+SPLIT_TEST_FRACTION = 0.2
+CHAMPION_SELECTION_RULE = "validation PR-AUC (desc), then Brier score (asc), then ROC-AUC (desc)"
+
+
+def describe_pipeline(estimator: Pipeline) -> list[dict[str, object]]:
+    """Return JSON-safe step classes and scalar hyperparameters for a pipeline."""
+
+    steps: list[dict[str, object]] = []
+    for name, step in estimator.steps:
+        params = {
+            # Non-finite floats (e.g. SimpleImputer's ``missing_values=nan``) are stored
+            # as strings: NaN is not valid JSON (PostgreSQL rejects it) and NaN != NaN
+            # would make recorded-vs-current comparisons fail spuriously.
+            key: value if not isinstance(value, float) or math.isfinite(value) else str(value)
+            for key, value in sorted(step.get_params(deep=False).items())
+            if isinstance(value, (bool, int, float, str)) or value is None
+        }
+        steps.append({"name": name, "class": type(step).__name__, "params": params})
+    return steps
 
 
 @dataclass
@@ -67,9 +109,11 @@ class TrainingService:
         self,
         settings: Settings | None = None,
         database_url: str | None = None,
+        quality_policy: DataQualityPolicy | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.database_url = database_url or self.settings.database_url
+        self.quality_policy = quality_policy or DataQualityPolicy()
 
     def train(
         self,
@@ -81,22 +125,79 @@ class TrainingService:
         with session_scope(self.database_url) as session:
             repository = StorageRepository(session)
             dataset_version = repository.get_dataset_version(dataset_version_id)
+            dataset_reports = repository.list_quality_reports(
+                stage=STAGE_DATASET_BUILD,
+                dataset_version_id=dataset_version_id,
+                limit=1,
+            )
+
+        requested_horizons = list(horizons or dataset_version.horizons)
+        dataset_quality_report = dataset_reports[0] if dataset_reports else None
+        pre_training_checks = [
+            check_artifact_integrity(
+                dataset_version.artifact_path,
+                dataset_version.artifact_hash,
+                "dataset",
+                check_id="training.dataset_artifact_integrity",
+            ),
+            self._dataset_quality_gate_check(dataset_quality_report),
+        ]
+        if any(check.status == "fail" for check in pre_training_checks):
+            self._persist_training_report(
+                QualityReport(stage=STAGE_TRAINING, checks=tuple(pre_training_checks)),
+                dataset_version=dataset_version,
+                horizon=None,
+                requested_horizons=requested_horizons,
+                raise_on_failure=True,
+            )
 
         dataset_frame = pd.read_parquet(dataset_version.artifact_path)
         dataset_frame["date"] = pd.to_datetime(dataset_frame["date"])
-        requested_horizons = list(horizons or dataset_version.horizons)
         persisted_models: list[ModelVersion] = []
 
         for horizon in requested_horizons:
             target_column = f"target_up_{horizon}d"
 
             training_frame = dataset_frame.dropna(subset=[target_column]).copy()
-            split = build_temporal_split(
-                training_frame,
-                embargo_days=horizon,
-                minimum_train_dates=self.settings.min_training_days,
-            )
+            split = self.build_split(training_frame, horizon)
             feature_columns = list(dataset_version.feature_columns)
+            training_report = QualityReport(
+                stage=STAGE_TRAINING,
+                checks=(
+                    *pre_training_checks,
+                    *run_split_checks(
+                        dataset_frame,
+                        {
+                            "train": split.train_dates,
+                            "validation": split.validation_dates,
+                            "test": split.test_dates,
+                        },
+                        horizon=horizon,
+                        feature_columns=feature_columns,
+                        target_column=target_column,
+                        policy=self.quality_policy,
+                    ),
+                ),
+            )
+            training_report_id = self._persist_training_report(
+                training_report,
+                dataset_version=dataset_version,
+                horizon=horizon,
+                requested_horizons=requested_horizons,
+                raise_on_failure=True,
+            )
+            governance_json: dict[str, object] = {
+                "training_quality_report_id": training_report_id,
+                "training_quality_status": training_report.status,
+                "dataset_quality_report_id": (
+                    dataset_quality_report.id if dataset_quality_report else None
+                ),
+                "dataset_quality_status": (
+                    dataset_quality_report.status if dataset_quality_report else None
+                ),
+                "dataset_artifact_sha256": dataset_version.artifact_hash,
+                "quality_policy_version": self.quality_policy.version,
+            }
             candidate_results = self._train_candidates(
                 dataset_frame=training_frame,
                 dataset_version_id=dataset_version.id,
@@ -104,6 +205,7 @@ class TrainingService:
                 target_column=target_column,
                 horizon=horizon,
                 split=split,
+                governance_json=governance_json,
             )
 
             ranked_candidates = rank_candidate_metrics(
@@ -190,6 +292,16 @@ class TrainingService:
             model_version = repository.get_model_version(model_version_id)
             dataset_version = repository.get_dataset_version(model_version.dataset_version_id)
 
+        require_artifact_integrity(
+            model_version.artifact_path,
+            model_version.artifact_hash,
+            "model",
+        )
+        require_artifact_integrity(
+            dataset_version.artifact_path,
+            dataset_version.artifact_hash,
+            "dataset",
+        )
         bundle = joblib.load(model_version.artifact_path)
         dataset_frame = pd.read_parquet(dataset_version.artifact_path)
         dataset_frame["date"] = pd.to_datetime(dataset_frame["date"])
@@ -203,6 +315,47 @@ class TrainingService:
                 dataset_frame=dataset_frame,
             )
 
+    def build_split(self, training_frame: pd.DataFrame, horizon: int) -> TemporalSplit:
+        """Return the embargoed temporal holdout split used for registry training."""
+
+        return build_temporal_split(
+            training_frame,
+            validation_fraction=SPLIT_VALIDATION_FRACTION,
+            test_fraction=SPLIT_TEST_FRACTION,
+            embargo_days=horizon,
+            minimum_train_dates=self.settings.min_training_days,
+        )
+
+    def refit_model_family(
+        self,
+        training_frame: pd.DataFrame,
+        dataset_version_id: str,
+        feature_columns: list[str],
+        target_column: str,
+        horizon: int,
+        model_family: str,
+        split: TemporalSplit,
+    ) -> ModelArtifactBundle:
+        """Refit one calibrated family exactly as ``train`` does (used for reproduction)."""
+
+        return self._fit_model_family(
+            dataset_frame=training_frame,
+            dataset_version_id=dataset_version_id,
+            feature_columns=feature_columns,
+            target_column=target_column,
+            horizon=horizon,
+            model_family=model_family,
+            split=split,
+        )
+
+    def candidate_pipeline_description(self, model_family: str) -> list[dict[str, object]]:
+        """Describe the current code's (unfitted) pipeline for one model family."""
+
+        estimators = self._candidate_estimators()
+        if model_family not in estimators:
+            raise LookupError(f"Unknown model family: {model_family}")
+        return describe_pipeline(estimators[model_family])
+
     def _train_candidates(
         self,
         dataset_frame: pd.DataFrame,
@@ -211,6 +364,7 @@ class TrainingService:
         target_column: str,
         horizon: int,
         split: TemporalSplit,
+        governance_json: dict[str, object] | None = None,
     ) -> list[CandidateTrainingResult]:
         """Train all baseline candidate model families for a horizon."""
 
@@ -258,16 +412,23 @@ class TrainingService:
                     "trained_at": datetime.now(tz=UTC).isoformat(),
                     "validation_metrics": validation_metrics,
                     "test_metrics": test_metrics,
+                    "training_config": self._training_config(
+                        fitted_estimator,
+                        calibrator,
+                        horizon,
+                        split,
+                    ),
+                    "governance": dict(governance_json or {}),
+                    "provenance": provenance_snapshot(),
                 },
             )
-            artifact_path = self._build_artifact_path(
+            artifact_path, artifact_hash = self._write_model_artifact(
+                bundle,
                 dataset_version_id,
                 horizon,
                 model_family,
                 split_summary,
             )
-            artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump(bundle, artifact_path)
 
             results.append(
                 CandidateTrainingResult(
@@ -276,7 +437,7 @@ class TrainingService:
                     validation_metrics=validation_metrics,
                     test_metrics=test_metrics,
                     artifact_path=artifact_path,
-                    artifact_hash=sha256_file(artifact_path),
+                    artifact_hash=artifact_hash,
                 )
             )
 
@@ -453,8 +614,13 @@ class TrainingService:
         horizon: int,
         model_family: str,
         split_summary: dict[str, dict[str, Any]],
+        artifact_hash: str,
     ) -> Path:
-        """Build a deterministic artifact path for a model candidate."""
+        """Build a content-addressed artifact path for a model candidate.
+
+        The configuration key keeps paths readable; the content digest guarantees that
+        retraining never overwrites an artifact referenced by an earlier registry row.
+        """
 
         artifact_key = sha256_json(
             {
@@ -464,8 +630,127 @@ class TrainingService:
                 "split_summary": split_summary,
             }
         )[:12]
-        filename = f"model_{dataset_version_id[:8]}_{horizon}d_{model_family}_{artifact_key}.joblib"
+        filename = (
+            f"model_{dataset_version_id[:8]}_{horizon}d_{model_family}_{artifact_key}"
+            f"_{artifact_hash[:12]}.joblib"
+        )
         return Path(self.settings.artifact_root) / "models" / filename
+
+    def _write_model_artifact(
+        self,
+        bundle: ModelArtifactBundle,
+        dataset_version_id: str,
+        horizon: int,
+        model_family: str,
+        split_summary: dict[str, dict[str, Any]],
+    ) -> tuple[Path, str]:
+        """Serialize a bundle to an immutable, content-addressed path."""
+
+        directory = Path(self.settings.artifact_root) / "models"
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / f".model_{uuid4().hex}.joblib.tmp"
+        joblib.dump(bundle, temporary)
+        artifact_hash = sha256_file(temporary)
+        artifact_path = self._build_artifact_path(
+            dataset_version_id,
+            horizon,
+            model_family,
+            split_summary,
+            artifact_hash,
+        )
+        os.replace(temporary, artifact_path)
+        return artifact_path, artifact_hash
+
+    def _training_config(
+        self,
+        estimator: Pipeline,
+        calibrator: ProbabilityCalibrator,
+        horizon: int,
+        split: TemporalSplit,
+    ) -> dict[str, object]:
+        """Return the hyperparameters and evaluation protocol needed to reproduce a fit."""
+
+        return {
+            "pipeline_steps": describe_pipeline(estimator),
+            "calibration": {"method": calibrator.strategy, "fit_on": "validation"},
+            "split": {
+                "method": "embargoed_temporal_holdout",
+                "validation_fraction": SPLIT_VALIDATION_FRACTION,
+                "test_fraction": SPLIT_TEST_FRACTION,
+                "embargo_days": split.embargo_days,
+                "minimum_train_dates": self.settings.min_training_days,
+                "train_dates": len(split.train_dates),
+                "validation_dates": len(split.validation_dates),
+                "test_dates": len(split.test_dates),
+            },
+            "horizon_days": horizon,
+            "champion_selection": CHAMPION_SELECTION_RULE,
+            "test_split_usage": "reporting only; never used for fitting, calibration, "
+            "or champion selection",
+        }
+
+    def _dataset_quality_gate_check(
+        self,
+        dataset_report: QualityReportRecord | None,
+    ) -> CheckResult:
+        """Translate the dataset build verdict into a training gate check."""
+
+        if dataset_report is None:
+            return CheckResult(
+                check_id="training.dataset_quality_gate",
+                category="governance",
+                status="warn",
+                message=(
+                    "No dataset quality report exists (dataset predates quality gates); "
+                    "training proceeds with unverified input quality."
+                ),
+                observed={"dataset_quality_report_id": None},
+            )
+        status: CheckStatus = worst_status([dataset_report.status])
+        return CheckResult(
+            check_id="training.dataset_quality_gate",
+            category="governance",
+            status=status,
+            message=f"Dataset quality report verdict: {dataset_report.summary}.",
+            observed={
+                "dataset_quality_report_id": dataset_report.id,
+                "dataset_quality_status": dataset_report.status,
+            },
+        )
+
+    def _persist_training_report(
+        self,
+        report: QualityReport,
+        dataset_version: DatasetVersion,
+        horizon: int | None,
+        requested_horizons: Sequence[int],
+        raise_on_failure: bool,
+    ) -> str:
+        """Persist a training gate report and optionally raise when it failed."""
+
+        with session_scope(self.database_url) as session:
+            record = persist_quality_report(
+                StorageRepository(session),
+                report,
+                self.quality_policy,
+                request_json={
+                    "dataset_version_id": dataset_version.id,
+                    "horizon_days": horizon,
+                    "requested_horizons": list(requested_horizons),
+                },
+                dataset_version_id=dataset_version.id,
+                horizon_days=horizon,
+            )
+            report_id = record.id
+        if raise_on_failure and not report.passed:
+            logger.warning(
+                "Training blocked for dataset %s horizon %s by report %s",
+                dataset_version.id,
+                horizon,
+                report_id,
+            )
+            raise DataQualityGateError(report, report_id)
+        return report_id
 
     def _build_split_summary(
         self,

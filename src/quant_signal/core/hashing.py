@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -34,3 +37,22 @@ def sha256_json(payload: Any) -> str:
         default=str,
     ).encode("utf-8")
     return sha256_bytes(serialized)
+
+
+def sha256_frame(frame: pd.DataFrame, columns: Sequence[str], sort_by: Sequence[str]) -> str:
+    """Return a stable digest of selected DataFrame columns in a canonical row order.
+
+    Dates are serialized as ISO strings and floats with round-trip precision, so the
+    digest only changes when the underlying values change.
+    """
+
+    canonical = frame.loc[:, list(columns)].copy()
+    for column in canonical.columns:
+        if pd.api.types.is_datetime64_any_dtype(canonical[column]):
+            canonical[column] = canonical[column].dt.strftime("%Y-%m-%d")
+        elif canonical[column].dtype == object:
+            canonical[column] = canonical[column].map(
+                lambda value: value.isoformat() if hasattr(value, "isoformat") else value
+            )
+    canonical = canonical.sort_values(list(sort_by), kind="mergesort").reset_index(drop=True)
+    return sha256_bytes(canonical.to_csv(index=False, lineterminator="\n").encode("utf-8"))

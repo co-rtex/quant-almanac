@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from quant_signal.storage.models import (
@@ -17,6 +17,7 @@ from quant_signal.storage.models import (
     IngestionRun,
     ModelEvaluation,
     ModelVersion,
+    QualityReportRecord,
     ShapRun,
     SignalSnapshot,
     Symbol,
@@ -123,6 +124,46 @@ class ShapRunRecord:
     artifact_path: str
     artifact_hash: str
     summary_json: dict[str, object]
+
+
+@dataclass(frozen=True)
+class QualityReportPayload:
+    """Quality or governance gate evidence to persist."""
+
+    stage: str
+    status: str
+    policy_version: str
+    check_count: int
+    failure_count: int
+    warning_count: int
+    summary: str
+    checks_json: list[dict[str, object]]
+    request_json: dict[str, object]
+    context_json: dict[str, object]
+    dataset_version_id: str | None = None
+    model_version_id: str | None = None
+    horizon_days: int | None = None
+
+
+@dataclass(frozen=True)
+class BarProvenanceRow:
+    """Aggregated provenance for the persisted bars feeding a dataset build."""
+
+    symbol: str
+    source: str
+    ingestion_run_id: str | None
+    row_count: int
+    first_date: date
+    last_date: date
+
+
+@dataclass(frozen=True)
+class SignalSnapshotStats:
+    """Aggregate statistics for one model version's persisted signal snapshots."""
+
+    snapshot_count: int
+    first_as_of_date: date | None
+    last_as_of_date: date | None
 
 
 class StorageRepository:
@@ -475,3 +516,174 @@ class StorageRepository:
         self.session.add(shap_run)
         self.session.flush()
         return shap_run
+
+    def create_quality_report(self, record: QualityReportPayload) -> QualityReportRecord:
+        """Persist one append-only quality report."""
+
+        report = QualityReportRecord(
+            stage=record.stage,
+            status=record.status,
+            policy_version=record.policy_version,
+            dataset_version_id=record.dataset_version_id,
+            model_version_id=record.model_version_id,
+            horizon_days=record.horizon_days,
+            check_count=record.check_count,
+            failure_count=record.failure_count,
+            warning_count=record.warning_count,
+            summary=record.summary,
+            checks_json=record.checks_json,
+            request_json=record.request_json,
+            context_json=record.context_json,
+        )
+        self.session.add(report)
+        self.session.flush()
+        return report
+
+    def get_quality_report(self, quality_report_id: str) -> QualityReportRecord:
+        """Return a quality report by id."""
+
+        report = self.session.get(QualityReportRecord, quality_report_id)
+        if report is None:
+            raise LookupError(f"Unknown quality report: {quality_report_id}")
+        return report
+
+    def list_quality_reports(
+        self,
+        stage: str | None = None,
+        status: str | None = None,
+        dataset_version_id: str | None = None,
+        model_version_id: str | None = None,
+        limit: int = 100,
+    ) -> list[QualityReportRecord]:
+        """Return quality reports, newest first, with optional filters."""
+
+        statement = select(QualityReportRecord)
+        if stage is not None:
+            statement = statement.where(QualityReportRecord.stage == stage)
+        if status is not None:
+            statement = statement.where(QualityReportRecord.status == status)
+        if dataset_version_id is not None:
+            statement = statement.where(
+                QualityReportRecord.dataset_version_id == dataset_version_id
+            )
+        if model_version_id is not None:
+            statement = statement.where(QualityReportRecord.model_version_id == model_version_id)
+        statement = statement.order_by(
+            QualityReportRecord.created_at.desc(),
+            QualityReportRecord.id,
+        ).limit(limit)
+        return list(self.session.execute(statement).scalars())
+
+    def summarize_bar_provenance(
+        self,
+        symbols: Sequence[str],
+        end_date: date | None = None,
+    ) -> list[BarProvenanceRow]:
+        """Group the bars a dataset build would read by symbol, source, and ingestion run."""
+
+        normalized = sorted({symbol.upper() for symbol in symbols})
+        if not normalized:
+            return []
+        statement = (
+            select(
+                Symbol.symbol,
+                DailyBar.source,
+                DailyBar.ingestion_run_id,
+                func.count(DailyBar.id),
+                func.min(DailyBar.trade_date),
+                func.max(DailyBar.trade_date),
+            )
+            .join(Symbol, DailyBar.symbol_id == Symbol.id)
+            .where(Symbol.symbol.in_(normalized))
+            .group_by(Symbol.symbol, DailyBar.source, DailyBar.ingestion_run_id)
+            .order_by(Symbol.symbol, DailyBar.source)
+        )
+        if end_date is not None:
+            statement = statement.where(DailyBar.trade_date <= end_date)
+        return [
+            BarProvenanceRow(
+                symbol=str(row[0]),
+                source=str(row[1]),
+                ingestion_run_id=row[2],
+                row_count=int(row[3]),
+                first_date=row[4],
+                last_date=row[5],
+            )
+            for row in self.session.execute(statement).all()
+        ]
+
+    def list_ingestion_runs(self, ingestion_run_ids: Sequence[str]) -> list[IngestionRun]:
+        """Return ingestion runs for the given ids, oldest first."""
+
+        if not ingestion_run_ids:
+            return []
+        statement = (
+            select(IngestionRun)
+            .where(IngestionRun.id.in_(list(ingestion_run_ids)))
+            .order_by(IngestionRun.started_at)
+        )
+        return list(self.session.execute(statement).scalars())
+
+    def list_dataset_versions(self, limit: int = 100) -> list[DatasetVersion]:
+        """Return dataset versions, newest first."""
+
+        statement = (
+            select(DatasetVersion)
+            .order_by(DatasetVersion.created_at.desc(), DatasetVersion.id)
+            .limit(limit)
+        )
+        return list(self.session.execute(statement).scalars())
+
+    def list_model_versions(
+        self,
+        limit: int = 200,
+        dataset_version_id: str | None = None,
+    ) -> list[ModelVersion]:
+        """Return model versions, newest first."""
+
+        statement = select(ModelVersion)
+        if dataset_version_id is not None:
+            statement = statement.where(ModelVersion.dataset_version_id == dataset_version_id)
+        statement = statement.order_by(
+            ModelVersion.created_at.desc(),
+            ModelVersion.horizon_days,
+            ModelVersion.champion_rank,
+            ModelVersion.id,
+        ).limit(limit)
+        return list(self.session.execute(statement).scalars())
+
+    def list_backtest_runs(self, model_version_id: str) -> list[BacktestRun]:
+        """Return backtest runs for a model version, newest first."""
+
+        statement = (
+            select(BacktestRun)
+            .where(BacktestRun.model_version_id == model_version_id)
+            .order_by(BacktestRun.created_at.desc(), BacktestRun.id)
+        )
+        return list(self.session.execute(statement).scalars())
+
+    def list_shap_runs(self, model_version_id: str) -> list[ShapRun]:
+        """Return SHAP runs for a model version, newest first."""
+
+        statement = (
+            select(ShapRun)
+            .where(ShapRun.model_version_id == model_version_id)
+            .order_by(ShapRun.created_at.desc(), ShapRun.id)
+        )
+        return list(self.session.execute(statement).scalars())
+
+    def signal_snapshot_stats(self, model_version_id: str) -> SignalSnapshotStats:
+        """Return snapshot counts and the published date range for a model version."""
+
+        row = self.session.execute(
+            select(
+                func.count(SignalSnapshot.id),
+                func.min(SignalSnapshot.as_of_date),
+                func.max(SignalSnapshot.as_of_date),
+            ).where(SignalSnapshot.model_version_id == model_version_id)
+        ).one()
+        return SignalSnapshotStats(
+            snapshot_count=int(row[0]),
+            first_as_of_date=row[1],
+            last_as_of_date=row[2],
+        )

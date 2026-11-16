@@ -31,6 +31,10 @@ from quant_signal.backtesting.regimes import (
 )
 from quant_signal.core.config import Settings, get_settings
 from quant_signal.core.hashing import sha256_file, sha256_json
+from quant_signal.core.provenance import provenance_snapshot
+from quant_signal.features.splits import TemporalSplit
+from quant_signal.quality import require_artifact_integrity
+from quant_signal.quality.training import label_realization_dates
 from quant_signal.serving.service import rank_signal_frame
 from quant_signal.storage.db import session_scope
 from quant_signal.storage.models import BacktestRun
@@ -65,6 +69,63 @@ class BacktestSimulationResult:
     sleeves_closed: int
 
 
+@dataclass
+class WalkForwardGuard:
+    """Proves every walk-forward refit only used labels realized before scoring began.
+
+    For each monthly window the rows used to fit and calibrate the model are checked:
+    the latest session on which any of their h-day labels became known must precede the
+    first session of the scored month. A violation aborts the backtest.
+    """
+
+    windows_trained: int = 0
+    windows_skipped: int = 0
+    min_sessions_slack: int | None = None
+    latest_label_realized: pd.Timestamp | None = None
+
+    def verify_window(
+        self,
+        history: pd.DataFrame,
+        split: TemporalSplit,
+        label_realized: pd.Series,
+        month_start: pd.Timestamp,
+    ) -> None:
+        """Raise when a fitted window used a label realized on/after the scored month."""
+
+        fitted_dates = pd.DatetimeIndex([*split.train_dates, *split.validation_dates])
+        fitted_rows = history[history["date"].isin(fitted_dates)]
+        realized = label_realized.loc[fitted_rows.index]
+        if realized.isna().any() or realized.max() >= month_start:
+            raise RuntimeError(
+                "Walk-forward leakage: a training/calibration label for the window scored "
+                f"from {month_start.date()} was realized on or after that date."
+            )
+        latest = pd.Timestamp(realized.max())
+        # ``history`` only holds sessions before ``month_start``, so this counts the
+        # sessions between the last realized label and the first scored session.
+        slack_sessions = int(history.loc[history["date"] > latest, "date"].nunique())
+        self.windows_trained += 1
+        self.min_sessions_slack = (
+            slack_sessions
+            if self.min_sessions_slack is None
+            else min(self.min_sessions_slack, slack_sessions)
+        )
+        if self.latest_label_realized is None or latest > self.latest_label_realized:
+            self.latest_label_realized = latest
+
+    def to_json(self) -> dict[str, object]:
+        """Return the persisted guard evidence."""
+
+        return {
+            "status": "pass" if self.windows_trained else "not_applicable",
+            "windows_trained": self.windows_trained,
+            "windows_skipped": self.windows_skipped,
+            "min_sessions_between_last_label_and_scoring": self.min_sessions_slack,
+            "rule": "every train/validation label used by a refit is realized strictly "
+            "before the first scored session of its month",
+        }
+
+
 class BacktestService:
     """Run regime-aware walk-forward backtests for a persisted model version."""
 
@@ -93,8 +154,15 @@ class BacktestService:
             model_version = repository.get_model_version(model_version_id)
             dataset_version = repository.get_dataset_version(model_version.dataset_version_id)
 
+        require_artifact_integrity(
+            dataset_version.artifact_path,
+            dataset_version.artifact_hash,
+            "dataset",
+        )
         dataset_frame = pd.read_parquet(dataset_version.artifact_path)
         dataset_frame["date"] = pd.to_datetime(dataset_frame["date"])
+        label_realized = label_realization_dates(dataset_frame, model_version.horizon_days)
+        guard = WalkForwardGuard()
         monthly_start_dates = self._monthly_start_dates(dataset_frame["date"])
         top_n_signals = top_n or self.settings.top_n_signals
         resolved_assumptions = (
@@ -107,6 +175,7 @@ class BacktestService:
                 subset=[model_version.target_column]
             )
             if history["date"].nunique() < self.settings.min_training_days:
+                guard.windows_skipped += 1
                 continue
 
             try:
@@ -124,7 +193,10 @@ class BacktestService:
                     split=split,
                 )
             except ValueError:
+                guard.windows_skipped += 1
                 continue
+
+            guard.verify_window(history, split, label_realized, month_start)
 
             month_frame = dataset_frame[
                 dataset_frame["date"].dt.to_period("M") == month_start.to_period("M")
@@ -196,6 +268,16 @@ class BacktestService:
                         "detail_artifact_path": str(detail_artifact_path),
                         "detail_artifact_hash": sha256_file(detail_artifact_path),
                         "execution_assumptions": resolved_assumptions.to_metadata_json(),
+                        "lineage": {
+                            "dataset_version_id": dataset_version.id,
+                            "dataset_artifact_sha256": dataset_version.artifact_hash,
+                            "registered_model_artifact_sha256": model_version.artifact_hash,
+                            "model_family": model_version.model_family,
+                            "retraining": "monthly walk-forward refit of the registered model "
+                            "family; the registered model artifact itself is not scored",
+                        },
+                        "walk_forward_guard": guard.to_json(),
+                        "provenance": provenance_snapshot(),
                     },
                 )
             )
