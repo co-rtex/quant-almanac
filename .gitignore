@@ -16,3 +16,6 @@ artifacts/
 !artifacts/models/.gitkeep
 !artifacts/backtests/.gitkeep
 !artifacts/explainability/.gitkeep
+
+# Local governance demo output (regenerate with: quant-almanac-demo run)
+demo/

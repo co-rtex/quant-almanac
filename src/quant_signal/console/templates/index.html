@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip %}
+{% set active = 'index' %}
+{% block title %}Models &amp; evidence · Quant Almanac{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <p class="eyebrow">Model governance</p>
+    <h1>Models &amp; evidence</h1>
+    <p class="lede">Select a model to trace it back to its source data, inspect the quality gates it passed, re-verify every artifact hash, and see what it cannot claim.</p>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="stat-label">Registered models</div><div class="stat-value" data-testid="model-count">{{ models|length }}</div><div class="stat-note">candidates and champions</div></div>
+  <div class="stat"><div class="stat-label">Dataset versions</div><div class="stat-value">{{ dataset_count }}</div><div class="stat-note">with trained models</div></div>
+  <div class="stat"><div class="stat-label">Quality reports</div><div class="stat-value">{{ reports|length }}</div><div class="stat-note">most recent 50</div></div>
+  <div class="stat"><div class="stat-label">Blocked dataset builds</div><div class="stat-value" data-testid="blocked-count">{{ blocked|length }}</div><div class="stat-note">rejected by the quality gate</div></div>
+</div>
+
+<section class="card" aria-labelledby="models-heading">
+  <div class="card-head">
+    <div>
+      <h2 id="models-heading">Registered models</h2>
+      <p class="section-note">Statuses shown here are the verdicts persisted when each stage ran. Open a model to re-verify them live.</p>
+    </div>
+  </div>
+  {% if models %}
+  <div class="table-scroll">
+  <table data-testid="models-table">
+    <thead><tr>
+      <th>Model</th><th>Horizon</th><th>Rank</th><th>Dataset (as of)</th><th>Dataset quality</th><th>Training gate</th><th class="num">Test ROC-AUC</th><th class="num">Test PR-AUC</th>
+    </tr></thead>
+    <tbody>
+    {% for model in models %}
+      <tr>
+        <td>
+          <a href="/console/models/{{ model.model_version_id }}" data-testid="model-link">{{ model.model_family|replace('_', ' ') }}</a>
+          <div class="hash">{{ model.model_version_id|short }}</div>
+          {% if model.synthetic %}<span class="tag synthetic">synthetic</span>{% endif %}
+        </td>
+        <td>{{ model.horizon_days }}d</td>
+        <td>{% if model.champion_rank == 1 %}<span class="tag">champion</span>{% else %}{{ model.champion_rank or '—' }}{% endif %}</td>
+        <td><span class="hash">{{ model.dataset_version_id|short }}</span><div class="muted">{{ model.dataset_as_of_date or '—' }}</div></td>
+        <td>{{ chip(model.dataset_quality_status or 'unavailable') }}</td>
+        <td>{{ chip(model.training_quality_status or 'unavailable') }}</td>
+        <td class="num">{{ model.test_roc_auc|num }}</td>
+        <td class="num">{{ model.test_pr_auc|num }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No models are registered yet. Run the demo or the pipeline CLI to create some.</p>
+  {% endif %}
+</section>
+
+<section class="card" aria-labelledby="reports-heading">
+  <div class="card-head">
+    <div>
+      <h2 id="reports-heading">Quality reports</h2>
+      <p class="section-note">Every dataset build, training gate, and reproduction run persists a report — including builds that were blocked and therefore have no dataset version.</p>
+    </div>
+  </div>
+  {% if reports %}
+  <div class="table-scroll">
+  <table data-testid="reports-table">
+    <thead><tr><th>Status</th><th>Stage</th><th>Summary</th><th>Subject</th><th>Recorded</th></tr></thead>
+    <tbody>
+    {% for report in reports %}
+      <tr data-stage="{{ report.stage }}" data-status="{{ report.status }}">
+        <td>{{ chip(report.status) }}</td>
+        <td><a href="/console/quality-reports/{{ report.quality_report_id }}">{{ report.stage|replace('_', ' ') }}</a>{% if report.horizon_days %} <span class="muted">· {{ report.horizon_days }}d</span>{% endif %}</td>
+        <td>{{ report.summary }}</td>
+        <td class="hash">
+          {% if report.model_version_id %}model {{ report.model_version_id|short }}
+          {% elif report.dataset_version_id %}dataset {{ report.dataset_version_id|short }}
+          {% else %}<span class="muted">no dataset (blocked)</span>{% endif %}
+        </td>
+        <td class="muted">{{ (report.created_at or '')[:19]|replace('T', ' ') }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No quality reports recorded.</p>
+  {% endif %}
+</section>
+{% endblock %}

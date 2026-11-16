@@ -1,0 +1,41 @@
+{% macro chip(status, large=false) -%}
+<span class="chip {{ status|status_class }}{% if large %} chip-lg{% endif %}" data-status="{{ status|status_class }}"><span class="chip-icon" aria-hidden="true">{{ status|status_icon }}</span>{{ status|status_label }}</span>
+{%- endmacro %}
+
+{% macro check_item(check) -%}
+  <li class="check" data-check-id="{{ check.check_id }}" data-status="{{ check.status }}">
+    <div>{{ chip(check.status) }}</div>
+    <div>
+      <div class="check-id">{{ check.check_id }}</div>
+      <p class="check-message">{{ check.message }}</p>
+      {% if check.observed or check.threshold or check.examples %}
+      <details class="evidence">
+        <summary>Evidence</summary>
+        {% if check.observed %}<pre>{{ {'observed': check.observed}|pretty }}</pre>{% endif %}
+        {% if check.threshold %}<pre>{{ {'threshold': check.threshold}|pretty }}</pre>{% endif %}
+        {% if check.examples %}<pre>{{ {'examples': check.examples}|pretty }}</pre>{% endif %}
+      </details>
+      {% endif %}
+    </div>
+  </li>
+{%- endmacro %}
+
+{# Failures and warnings are always visible; passing checks collapse behind a summary. #}
+{% macro check_list(checks, collapse_passing=true) -%}
+{% set attention = checks|rejectattr('status', 'equalto', 'pass')|list %}
+{% set passing = checks|selectattr('status', 'equalto', 'pass')|list %}
+{% if not checks %}<p class="empty">No checks recorded.</p>{% endif %}
+{% if attention %}
+<ul class="check-list">{% for check in attention %}{{ check_item(check) }}{% endfor %}</ul>
+{% endif %}
+{% if passing %}
+{% if collapse_passing %}
+<details class="passing" data-testid="passing-checks">
+  <summary>{{ passing|length }} passing check{{ '' if passing|length == 1 else 's' }}</summary>
+  <ul class="check-list">{% for check in passing %}{{ check_item(check) }}{% endfor %}</ul>
+</details>
+{% else %}
+<ul class="check-list">{% for check in passing %}{{ check_item(check) }}{% endfor %}</ul>
+{% endif %}
+{% endif %}
+{%- endmacro %}

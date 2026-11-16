@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Not found · Quant Almanac{% endblock %}
+{% block content %}
+<div class="card">
+  <p class="eyebrow">404</p>
+  <h1>{{ kind }} not found</h1>
+  <p class="lede">No record exists with identifier <code>{{ identifier }}</code>.</p>
+  <p><a href="/console">Back to models &amp; evidence</a></p>
+</div>
+{% endblock %}

@@ -1,0 +1,371 @@
+{% extends "base.html" %}
+{% from "_macros.html" import chip, check_list %}
+{% block title %}{{ e.model.model_family|replace('_', ' ') }} {{ e.model.horizon_days }}d · Quant Almanac{% endblock %}
+{% block content %}
+{% set m = e.model %}
+{% set d = e.dataset %}
+{% set v = e.verification %}
+<div class="page-head">
+  <div>
+    <p class="eyebrow"><a href="/console">Models</a> / {{ m.model_version_id|short }}</p>
+    <h1>{{ m.model_family|replace('_', ' ')|capitalize }} · {{ m.horizon_days }}-day horizon</h1>
+    <div class="meta-row">
+      <span>{% if m.champion_rank == 1 %}<span class="tag">champion</span>{% else %}candidate rank {{ m.champion_rank or '—' }}{% endif %}</span>
+      <span>target <code>{{ m.target_column }}</code></span>
+      <span>model <span class="hash" data-testid="model-id">{{ m.model_version_id }}</span></span>
+      <span>trained {{ (m.trained_at or m.created_at or '—')[:19]|replace('T', ' ') }}</span>
+    </div>
+  </div>
+  <div data-testid="verification-verdict">{{ chip(v.status, large=true) }}</div>
+</div>
+
+<section class="card" aria-labelledby="lineage-heading">
+  <div class="card-head">
+    <div>
+      <h2 id="lineage-heading">Lineage</h2>
+      <p class="section-note">Each hop is backed by a persisted record. Statuses come from the stage's own quality report or from the live verification below.</p>
+    </div>
+  </div>
+  <ol class="stepper" data-testid="lineage-stepper">
+    {% for stage in e.stages %}
+    <li class="step {{ stage.status|status_class }}" data-stage="{{ stage.key }}" data-status="{{ stage.status }}">
+      <div class="step-rail"><span class="step-dot" aria-hidden="true">{{ stage.status|status_icon }}</span><span class="step-line"></span></div>
+      <div class="step-title">{{ stage.title }}</div>
+      <div class="step-headline">{{ stage.headline }}</div>
+      <div class="step-detail">{{ stage.detail }}</div>
+      <div class="step-status">{{ stage.status|status_label }}</div>
+    </li>
+    {% endfor %}
+  </ol>
+</section>
+
+<div class="grid-2">
+  <section class="card" aria-labelledby="verification-heading" data-testid="verification">
+    <div class="card-head">
+      <div>
+        <h2 id="verification-heading">Live verification</h2>
+        <p class="section-note">Computed on this page load: artifacts are re-hashed, the bundle is reopened, source bars are re-fingerprinted, and split embargoes are recomputed from the dataset artifact.</p>
+      </div>
+      {{ chip(v.status) }}
+    </div>
+    <p class="muted">{{ v.check_count }} checks · {{ v.failure_count }} failed · {{ v.warning_count }} warnings</p>
+    {{ check_list(v.checks) }}
+  </section>
+
+  <section class="card" aria-labelledby="limitations-heading" data-testid="limitations">
+    <div class="card-head">
+      <div>
+        <h2 id="limitations-heading">Limitations</h2>
+        <p class="section-note">Derived from the evidence on this page and from documented methodology — not hand-written per model.</p>
+      </div>
+    </div>
+    <ul class="limitations">
+      {% for item in e.limitations %}
+      <li data-severity="{{ item.severity }}">
+        <span class="severity {{ item.severity }}">{{ item.severity }}</span>
+        <div><div>{{ item.text }}</div><div class="limitation-source">{{ item.source }}</div></div>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+
+<section class="card" aria-labelledby="dataset-heading" data-testid="dataset-health">
+  <div class="card-head">
+    <div>
+      <h2 id="dataset-heading">Dataset provenance &amp; health</h2>
+      <p class="section-note">Dataset <span class="hash">{{ d.dataset_version_id }}</span> · feature set <code>{{ d.feature_set_version }}</code></p>
+    </div>
+    {% if e.dataset_quality_report %}{{ chip(e.dataset_quality_report.status) }}{% else %}{{ chip('unavailable') }}{% endif %}
+  </div>
+  <div class="grid-2">
+    <div>
+      <h3>Manifest</h3>
+      <dl class="kv">
+        <dt>Observation period</dt><dd>{{ (d.date_range or {}).get('start', '—') }} → {{ (d.date_range or {}).get('end', '—') }} (as of {{ d.as_of_date }})</dd>
+        <dt>Rows</dt><dd>{{ d.row_count|num }} model rows from {{ d.raw_row_count|num }} source bars</dd>
+        <dt>Symbols</dt><dd>{{ d.symbols|join(', ') }} · benchmark {{ d.benchmark_symbol or '—' }}</dd>
+        <dt>Horizons</dt><dd>{{ d.horizons|join('d, ') }}d</dd>
+        <dt>Features</dt><dd>{{ d.feature_columns|length }} columns</dd>
+        <dt>Artifact SHA-256</dt><dd class="hash">{{ d.artifact_sha256 }}</dd>
+        <dt>Source-bar fingerprint</dt><dd class="hash">{{ (d.source_bars or {}).get('fingerprint_sha256') or 'Unavailable (dataset predates fingerprinting)' }}</dd>
+        <dt>Code revision</dt><dd class="hash">{% if d.code and d.code.commit %}{{ d.code.commit[:12] }}{% if d.code.dirty %} (uncommitted changes){% endif %}{% else %}Unavailable{% endif %}</dd>
+      </dl>
+    </div>
+    <div>
+      <h3>Ingestion runs</h3>
+      {% if e.ingestion_runs %}
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>Run</th><th>Provider</th><th>Status</th><th>Window</th><th class="num">Bars</th></tr></thead>
+        <tbody>
+        {% for run in e.ingestion_runs %}
+        <tr>
+          <td class="hash">{{ run.ingestion_run_id|short }}</td>
+          <td>{{ run.provider }}{% if run.synthetic %} <span class="tag synthetic">synthetic</span>{% endif %}</td>
+          <td>{{ chip('pass' if run.status == 'completed' else 'fail') }}</td>
+          <td>{{ run.start_date }} → {{ run.end_date }}</td>
+          <td class="num">{{ run.records_written|num }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      {% else %}
+      <p class="empty">Unavailable — this dataset did not record which ingestion runs produced its bars.</p>
+      {% endif %}
+      {% if e.missing_ingestion_run_ids %}<p class="muted">Recorded but no longer present: {{ e.missing_ingestion_run_ids|join(', ') }}</p>{% endif %}
+    </div>
+  </div>
+  {% if e.dataset_quality_report %}
+  <h3>Dataset build checks · <a href="/console/quality-reports/{{ e.dataset_quality_report.quality_report_id }}">report {{ e.dataset_quality_report.quality_report_id|short }}</a> · policy <code>{{ e.dataset_quality_report.policy_version }}</code></h3>
+  {{ check_list(e.dataset_quality_report.checks) }}
+  {% else %}
+  <p class="empty">No dataset quality report exists for this dataset (it was built before quality gates were introduced).</p>
+  {% endif %}
+</section>
+
+<section class="card" aria-labelledby="training-heading" data-testid="training-gate">
+  <div class="card-head">
+    <div>
+      <h2 id="training-heading">Training configuration &amp; gate</h2>
+      <p class="section-note">Embargoed temporal holdout. Calibration is fit on validation; the test split is used for reporting only.</p>
+    </div>
+    {% if e.training_quality_report %}{{ chip(e.training_quality_report.status) }}{% else %}{{ chip('unavailable') }}{% endif %}
+  </div>
+  {% if timeline.available %}
+  <figure class="figure">
+    <svg class="chart" viewBox="0 0 {{ timeline.width }} {{ timeline.height }}" role="img" aria-labelledby="timeline-title">
+      <title id="timeline-title">Split timeline in trading sessions</title>
+      {% for seg in timeline.segments if seg.width %}
+      <rect class="seg-{{ seg.kind }}" x="{{ seg.x }}" y="4" width="{{ seg.width }}" height="36" rx="4"><title>{{ seg.label }}: {{ seg.sessions }} sessions</title></rect>
+      {% if seg.show_label %}<text class="seg-label" x="{{ seg.label_x }}" y="27" text-anchor="middle">{{ seg.label }} · {{ seg.sessions }}</text>{% endif %}
+      {% endfor %}
+    </svg>
+    <div class="legend">
+      {% for item in timeline.legend %}
+      <span><span class="swatch {{ item.kind }}"></span>{{ item.label }} — {{ item.sessions }} sessions{% if item.kind == 'embargo' %} each{% endif %}</span>
+      {% endfor %}
+    </div>
+  </figure>
+  {% else %}
+  <p class="empty">Split session counts unavailable (model predates recorded training configuration).</p>
+  {% endif %}
+  <div class="grid-2">
+    <div>
+      <h3>Windows</h3>
+      <dl class="kv">
+        {% for name in ['train', 'validation', 'test'] %}
+        <dt>{{ name|capitalize }}</dt><dd>{{ m.windows[name].start or '—' }} → {{ m.windows[name].end or '—' }}</dd>
+        {% endfor %}
+        {% if m.training_config %}
+        <dt>Embargo</dt><dd>{{ m.training_config.split.embargo_days }} sessions (= horizon)</dd>
+        <dt>Calibration</dt><dd>{{ m.training_config.calibration.method }} on {{ m.training_config.calibration.fit_on }}</dd>
+        <dt>Champion rule</dt><dd>{{ m.training_config.champion_selection }}</dd>
+        {% endif %}
+      </dl>
+    </div>
+    <div>
+      <h3>Pipeline &amp; hyperparameters</h3>
+      {% if m.training_config %}
+      {% for step in m.training_config.pipeline_steps %}
+      <details class="evidence"><summary>{{ step.name }} · {{ step['class'] }}</summary><pre>{{ step.params|pretty }}</pre></details>
+      {% endfor %}
+      {% else %}
+      <p class="empty">Unavailable — hyperparameters were not recorded for this model.</p>
+      {% endif %}
+    </div>
+  </div>
+  {% if e.training_quality_report %}
+  <h3>Training gate checks · <a href="/console/quality-reports/{{ e.training_quality_report.quality_report_id }}">report {{ e.training_quality_report.quality_report_id|short }}</a></h3>
+  {{ check_list(e.training_quality_report.checks) }}
+  {% endif %}
+</section>
+
+<section class="card" aria-labelledby="evaluation-heading" data-testid="evaluation">
+  <div class="card-head">
+    <div>
+      <h2 id="evaluation-heading">Evaluation</h2>
+      <p class="section-note">Persisted per-split metrics. The ROC-AUC interval is a Hanley–McNeil approximation that assumes independent observations, so it understates uncertainty for overlapping horizons.</p>
+    </div>
+  </div>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Split</th><th class="num">n</th><th class="num">Positive rate</th><th class="num">ROC-AUC</th><th class="num">≈95% CI</th><th class="num">PR-AUC</th><th class="num">Brier</th><th class="num">Calib. error</th></tr></thead>
+    <tbody>
+    {% for row in e.evaluations %}
+    <tr data-split="{{ row.split_name }}">
+      <td>{{ row.split_name }}</td>
+      <td class="num">{{ row.sample_count|num }}</td>
+      <td class="num">{{ row.positive_rate|num }}</td>
+      <td class="num">{{ row.roc_auc|num }}</td>
+      <td class="num">{% if row.roc_auc_interval %}{{ row.roc_auc_interval.lower_95|num }}–{{ row.roc_auc_interval.upper_95|num }}{% else %}—{% endif %}</td>
+      <td class="num">{{ row.pr_auc|num }}</td>
+      <td class="num">{{ row.brier_score|num }}</td>
+      <td class="num">{{ row.calibration_error|num }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">No evaluations persisted.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+
+  <div class="grid-2">
+    <div>
+      <h3>Test-split reliability</h3>
+      {% if calibration and calibration.points %}
+      <figure>
+        <svg class="chart" viewBox="0 0 {{ calibration.width }} {{ calibration.height }}" width="{{ calibration.width }}" role="img" aria-labelledby="calibration-title">
+          <title id="calibration-title">Reliability diagram: mean predicted probability against observed positive rate per bin</title>
+          {% for tick in calibration.y_ticks %}
+          <line class="gridline" x1="{{ tick.x }}" x2="{{ tick.x2 }}" y1="{{ tick.y }}" y2="{{ tick.y }}"></line>
+          <text x="{{ tick.x - 8 }}" y="{{ tick.y + 4 }}" text-anchor="end">{{ tick.label }}</text>
+          {% endfor %}
+          {% for tick in calibration.x_ticks %}
+          <text x="{{ tick.x }}" y="{{ tick.y + 18 }}" text-anchor="middle">{{ tick.label }}</text>
+          {% endfor %}
+          <line class="axis" x1="{{ calibration.plot.left }}" x2="{{ calibration.plot.right }}" y1="{{ calibration.plot.bottom }}" y2="{{ calibration.plot.bottom }}"></line>
+          <line class="reference" x1="{{ calibration.diagonal.x1 }}" y1="{{ calibration.diagonal.y1 }}" x2="{{ calibration.diagonal.x2 }}" y2="{{ calibration.diagonal.y2 }}"></line>
+          <path class="series-line" d="{{ calibration.path }}"></path>
+          {% for point in calibration.points %}
+          <circle class="series-dot" cx="{{ point.cx }}" cy="{{ point.cy }}" r="5"><title>Bin {{ point.lower|num(2) }}–{{ point.upper|num(2) }}: mean prediction {{ point.prediction|num }}, observed {{ point.observed|num }}, n = {{ point.count }}</title></circle>
+          {% endfor %}
+        </svg>
+        <div class="legend"><span><span class="swatch series"></span>Test bins (hover for n)</span><span><span class="swatch reference"></span>Perfect calibration</span></div>
+      </figure>
+      <details class="evidence"><summary>Table view</summary>
+        <div class="table-scroll"><table>
+          <thead><tr><th>Bin</th><th class="num">n</th><th class="num">Mean prediction</th><th class="num">Observed rate</th></tr></thead>
+          <tbody>{% for point in calibration.points %}<tr><td>{{ point.lower|num(2) }}–{{ point.upper|num(2) }}</td><td class="num">{{ point.count }}</td><td class="num">{{ point.prediction|num }}</td><td class="num">{{ point.observed|num }}</td></tr>{% endfor %}</tbody>
+        </table></div>
+      </details>
+      {% else %}
+      <p class="empty">No test calibration bins persisted.</p>
+      {% endif %}
+    </div>
+    <div>
+      <h3>Candidates on the same dataset &amp; horizon</h3>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>Family</th><th class="num">Rank</th><th class="num">Val PR-AUC</th><th class="num">Val Brier</th><th class="num">Test ROC-AUC</th></tr></thead>
+        <tbody>
+        {% for c in e.candidates %}
+        <tr>
+          <td>{% if c.model_version_id == m.model_version_id %}<strong>{{ c.model_family|replace('_', ' ') }}</strong> <span class="muted">(this)</span>{% else %}<a href="/console/models/{{ c.model_version_id }}">{{ c.model_family|replace('_', ' ') }}</a>{% endif %}</td>
+          <td class="num">{{ c.champion_rank or '—' }}</td>
+          <td class="num">{{ c.validation_pr_auc|num }}</td>
+          <td class="num">{{ c.validation_brier_score|num }}</td>
+          <td class="num">{{ c.test_roc_auc|num }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      <p class="muted">Ranking uses validation metrics only; test metrics are shown for reporting and never influence selection.</p>
+    </div>
+  </div>
+</section>
+
+<div class="grid-2">
+  <section class="card" aria-labelledby="backtest-heading" data-testid="backtest">
+    <div class="card-head">
+      <div>
+        <h2 id="backtest-heading">Backtest evidence</h2>
+        <p class="section-note">{{ e.backtests|length }} run{{ '' if e.backtests|length == 1 else 's' }} recorded{% if latest_backtest %}; showing the latest{% endif %}.</p>
+      </div>
+    </div>
+    {% if latest_backtest %}
+    {% set b = latest_backtest %}
+    <p class="disclaimer">Simulated, long-only, equal-weight top-{{ b.top_n }} portfolio with monthly walk-forward refits{% if synthetic %} on <strong>synthetic</strong> prices{% endif %}. This is research evidence, not investment performance.</p>
+    <div class="metric-row">
+      <div class="metric"><div class="label">Cumulative (net)</div><div class="value">{{ b.metrics.cumulative_return|pct }}</div><div class="sub">benchmark {{ (b.benchmark_metrics or {}).get('benchmark_cumulative_return')|pct }}</div></div>
+      <div class="metric"><div class="label">Sharpe (ann.)</div><div class="value">{{ b.metrics.sharpe_ratio|num(2) }}</div><div class="sub">vol {{ b.metrics.annualized_volatility|num }}</div></div>
+      <div class="metric"><div class="label">Max drawdown</div><div class="value">{{ b.metrics.max_drawdown|pct }}</div><div class="sub">hit rate {{ b.metrics.hit_rate|num }}</div></div>
+    </div>
+    <dl class="kv">
+      <dt>Costs per side</dt><dd>{% if b.execution_assumptions %}{{ b.execution_assumptions.transaction_cost_bps|num(1) }} bps commission + {{ b.execution_assumptions.slippage_bps|num(1) }} bps slippage{% else %}Unavailable{% endif %}</dd>
+      <dt>Walk-forward guard</dt><dd>{% if b.walk_forward_guard %}{{ chip(b.walk_forward_guard.status if b.walk_forward_guard.status != 'not_applicable' else 'unavailable') }} {{ b.walk_forward_guard.windows_trained }} refits checked; ≥ {{ b.walk_forward_guard.min_sessions_between_last_label_and_scoring }} sessions between the last used label and scoring{% else %}Unavailable (run predates the guard){% endif %}</dd>
+      <dt>Signals scored</dt><dd>{{ b.signal_count|num }}</dd>
+      <dt>Dataset hash at run</dt><dd class="hash">{{ (b.lineage or {}).get('dataset_artifact_sha256') or 'Unavailable' }}</dd>
+      <dt>Artifact SHA-256</dt><dd class="hash">{{ b.artifact_sha256 }}</dd>
+    </dl>
+    {% else %}
+    <p class="empty">No backtest has been run for this model.</p>
+    <code class="command">quant-signal-pipeline backtest --model-version-id {{ m.model_version_id }}</code>
+    {% endif %}
+  </section>
+
+  <section class="card" aria-labelledby="shap-heading" data-testid="explanations">
+    <div class="card-head">
+      <div>
+        <h2 id="shap-heading">Explanations (SHAP)</h2>
+        <p class="section-note">{% if latest_shap and latest_shap.methodology %}Mean |SHAP| on the calibrated probability over {{ latest_shap.sample_size }} sampled test rows ({{ latest_shap.methodology.evaluation_window.start_date }} → {{ latest_shap.methodology.evaluation_window.end_date }}).{% elif latest_shap %}Mean |SHAP| over {{ latest_shap.sample_size }} test rows (methodology not recorded).{% else %}No explainability runs recorded.{% endif %}</p>
+      </div>
+    </div>
+    {% if importance and importance.bars %}
+    <svg class="chart" viewBox="0 0 {{ importance.width }} {{ importance.height }}" role="img" aria-labelledby="importance-title">
+      <title id="importance-title">Global feature importance (mean absolute SHAP value)</title>
+      {% for bar in importance.bars %}
+      <text class="bar-label" x="{{ importance.label_x }}" y="{{ bar.text_y }}" text-anchor="end">{{ bar.feature }}</text>
+      <rect class="bar" x="{{ bar.x }}" y="{{ bar.y }}" width="{{ bar.width }}" height="{{ bar.height }}" rx="4"><title>{{ bar.feature }}: mean |SHAP| {{ bar.value|num(4) }}</title></rect>
+      <text class="bar-value" x="{{ bar.value_x }}" y="{{ bar.text_y }}">{{ bar.value|num(4) }}</text>
+      {% endfor %}
+    </svg>
+    {% if latest_shap.local_explanations %}
+    <h3>Top-scored sampled rows</h3>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Date</th><th>Symbol</th><th class="num">Score</th><th>Largest contributions</th></tr></thead>
+      <tbody>
+      {% for row in latest_shap.local_explanations %}
+      <tr><td>{{ row.date }}</td><td>{{ row.symbol }}</td><td class="num">{{ row.score|num }}</td>
+        <td>{% for c in row.top_contributors[:3] %}<code>{{ c.feature }}</code> {{ '%+.4f'|format(c.shap_value) }}{% if not loop.last %}, {% endif %}{% endfor %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% endif %}
+    {% else %}
+    <p class="empty">No explainability run exists for this model.</p>
+    <code class="command">quant-signal-pipeline explain --model-version-id {{ m.model_version_id }}</code>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card" aria-labelledby="repro-heading" data-testid="reproducibility">
+  <div class="card-head">
+    <div>
+      <h2 id="repro-heading">Reproducibility</h2>
+      <p class="section-note">A reproduction run refits this model family from the immutable dataset artifact with the recorded split and hyperparameters, then compares test predictions and metrics with the registered model.</p>
+    </div>
+    {% if e.reproduction_reports %}{{ chip(e.reproduction_reports[0].status) }}{% else %}{{ chip('unavailable') }}{% endif %}
+  </div>
+  <div class="grid-2">
+    <div>
+      <h3>Recorded provenance</h3>
+      <dl class="kv">
+        <dt>Model artifact</dt><dd class="hash">{{ m.artifact_sha256 }}</dd>
+        <dt>Dataset artifact</dt><dd class="hash">{{ d.artifact_sha256 }}</dd>
+        {% if m.provenance %}
+        <dt>Commit</dt><dd class="hash">{{ m.provenance.code.commit or 'Unavailable' }}{% if m.provenance.code.dirty %} (uncommitted changes){% endif %}</dd>
+        <dt>Python</dt><dd>{{ m.provenance.runtime.python }}</dd>
+        <dt>Libraries</dt><dd>{% for name, version in m.provenance.runtime.packages|dictsort %}{{ name }} {{ version or '—' }}{% if not loop.last %} · {% endif %}{% endfor %}</dd>
+        {% else %}
+        <dt>Code &amp; runtime</dt><dd>Unavailable — not recorded for this model.</dd>
+        {% endif %}
+      </dl>
+      <h3>Reproduce locally</h3>
+      <code class="command">quant-signal-pipeline reproduce-model --model-version-id {{ m.model_version_id }}
+quant-signal-pipeline verify-model --model-version-id {{ m.model_version_id }}</code>
+    </div>
+    <div>
+      {% if e.reproduction_reports %}
+      {% set r = e.reproduction_reports[0] %}
+      <h3>Latest reproduction · <a href="/console/quality-reports/{{ r.quality_report_id }}">report {{ r.quality_report_id|short }}</a> · {{ (r.created_at or '')[:19]|replace('T', ' ') }}</h3>
+      {{ check_list(r.checks) }}
+      {% else %}
+      <p class="empty">This model has not been reproduced yet.</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+{% endblock %}
